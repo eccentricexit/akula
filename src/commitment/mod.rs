@@ -115,6 +115,21 @@ impl Cell {
         KECCAK_LENGTH + 1
     }
 
+    fn fill_from_account(&mut self, account: Option<&Account>) {
+        self.nonce = 0;
+        self.balance = U256::ZERO;
+        self.code_hash = EMPTY_HASH;
+        if let Some(account) = account {
+            self.nonce = account.nonce;
+            self.balance = account.balance;
+            self.code_hash = account.code_hash;
+        }
+    }
+
+    fn fill_from_storage(&mut self, storage: Option<U256>) {
+        self.storage = storage;
+    }
+
     // fn account_for_hashing(&self, storage_root_hash: H256) -> ArrayVec<u8, 128> {
     //     let mut buffer = ArrayVec::new();
 
@@ -517,7 +532,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             storage: Option<H256>,
         }
 
-        let mut changed_keys = BTreeMap::<PlainKey, ArrayVec<u8, 64>>::new();
+        let mut changed_keys = BTreeMap::<(Address, Option<H256>), ArrayVec<u8, 64>>::new();
 
         for (
             address,
@@ -532,13 +547,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             if account_changed {
                 let mut v = ArrayVec::new();
                 v.try_extend_from_slice(&hashed_address[..]).unwrap();
-                changed_keys.insert(
-                    PlainKey {
-                        address,
-                        storage: None,
-                    },
-                    v,
-                );
+                changed_keys.insert((address, None), v);
             }
 
             for location in changed_storage {
@@ -547,20 +556,15 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 let mut v = ArrayVec::new();
                 v.try_extend_from_slice(&hashed_address[..]).unwrap();
                 v.try_extend_from_slice(&hashed_location[..]).unwrap();
-                changed_keys.insert(
-                    PlainKey {
-                        address,
-                        storage: Some(location),
-                    },
-                    v,
-                );
+                changed_keys.insert((address, Some(location)), v);
             }
         }
 
-        for (plain_key, hashed_key) in changed_keys {
+        for ((address, storage), hashed_key) in changed_keys {
             trace!(
-                "plain_key={:?}, hashed_key={:?}, current_key={:?}",
-                plain_key,
+                "address={:?} storage={:?} hashed_key={:?}, current_key={:?}",
+                address,
+                storage,
                 hex::encode(&hashed_key),
                 hex::encode(&self.current_key),
             );
@@ -584,14 +588,14 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             }
 
             // Update the cell
-            if let Some(location) = plain_key.storage {
-                if let Some(value) = self.state.fetch_storage(plain_key.address, location)? {
-                    self.update_storage(plain_key.address, location, hashed_key, value);
+            if let Some(location) = storage {
+                if let Some(value) = self.state.fetch_storage(address, location)? {
+                    self.update_storage(address, location, hashed_key, value);
                 } else {
                     self.delete_cell(hashed_key);
                 }
-            } else if let Some(account) = self.state.fetch_account(plain_key.address)? {
-                self.update_account(plain_key.address, hashed_key, account);
+            } else if let Some(account) = self.state.fetch_account(address)? {
+                self.update_account(address, hashed_key, account);
             } else {
                 self.delete_cell(hashed_key);
             }
