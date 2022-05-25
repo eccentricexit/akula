@@ -1,9 +1,7 @@
 pub mod rlputil;
 
 use self::rlputil::*;
-use crate::{
-    crypto::keccak256, models::*, prefix_length, static_left_pad, u256_to_h256, zeroless_view,
-};
+use crate::{crypto::keccak256, models::*, prefix_length, u256_to_h256, zeroless_view};
 use anyhow::{bail, format_err};
 use array_macro::array;
 use arrayref::array_ref;
@@ -21,9 +19,7 @@ pub trait Trie {
 
     fn process_updates(
         &mut self,
-        plain_keys: &[u8],
-        hashed_keys: &[u8],
-        updates: &[Update],
+        updates: BTreeMap<Address, ProcessUpdateArg>,
     ) -> HashMap<Vec<u8>, Vec<u8>>;
 
     /// Produce root hash of the trie
@@ -394,100 +390,6 @@ pub struct HexPatriciaHashed<'state, S: State> {
 struct CellPosition {
     row: usize,
     col: usize,
-}
-
-#[derive(Clone, Debug)]
-pub struct Update {
-    pub flags: UpdateFlags,
-    pub balance: U256,
-    pub nonce: u64,
-    pub code_hash_or_storage: ArrayVec<u8, 32>,
-}
-
-impl Update {
-    fn decode(buf: &[u8], mut pos: usize) -> anyhow::Result<(Self, usize)> {
-        if buf.len() < pos + 1 {
-            bail!("decode Update: buffer too small for flags")
-        }
-        let flags = buf[pos];
-        pos += 1;
-
-        let mut u = Update {
-            flags,
-            balance: U256::ZERO,
-            nonce: 0,
-            code_hash_or_storage: ArrayVec::new(),
-        };
-        if flags & BALANCE_UPDATE != 0 {
-            if buf.len() < pos + 1 {
-                bail!("decode Update: buffer too small for balance len");
-            }
-            let balance_len = buf[pos] as usize;
-            pos += 1;
-            if buf.len() < pos + balance_len {
-                bail!("decode Update: buffer too small for balance");
-            }
-            u.balance = U256::from_be_bytes(static_left_pad(&buf[pos..pos + balance_len]));
-            pos += balance_len;
-        }
-
-        if flags & NONCE_UPDATE != 0 {
-            let (nonce_v, n) =
-                uvarint(&buf[pos..]).ok_or_else(|| format_err!("decode Update: nonce overflow"))?;
-            if n == 0 {
-                bail!("decode Update: buffer too small for nonce")
-            }
-            u.nonce = nonce_v;
-            pos += n;
-        }
-
-        if flags & CODE_UPDATE != 0 {
-            if buf.len() < pos + 32 {
-                bail!("decode Update: buffer too small for codeHash");
-            }
-            u.code_hash_or_storage.copy_from_slice(&buf[pos..pos + 32]);
-            pos += 32;
-        }
-
-        if flags & STORAGE_UPDATE != 0 {
-            let (l, n) = uvarint(&buf[pos..])
-                .ok_or_else(|| format_err!("decode Update: storage lee overflow"))?;
-            if n == 0 {
-                bail!("decode Update: buffer too small for storage len");
-            }
-            pos += n;
-
-            let l = l as usize;
-            if buf.len() < pos + l {
-                bail!("decode Update: buffer too small for storage");
-            }
-            u.code_hash_or_storage[..l].copy_from_slice(&buf[pos..pos + l]);
-            pos += l;
-        }
-
-        Ok((u, pos))
-    }
-
-    fn encode(&self) -> Vec<u8> {
-        let mut out = vec![self.flags];
-        if self.flags & BALANCE_UPDATE != 0 {
-            let encoded_balance = self.balance.to_be_bytes();
-            let s = zeroless_view(&encoded_balance);
-            out.push(s.len() as u8);
-            out.extend_from_slice(s);
-        }
-        if self.flags & NONCE_UPDATE != 0 {
-            encode_uvarint(&mut out, self.nonce);
-        }
-        if self.flags & CODE_UPDATE != 0 {
-            out.extend_from_slice(&self.code_hash_or_storage);
-        }
-        if self.flags & STORAGE_UPDATE != 0 {
-            encode_slice(&mut out, &*self.code_hash_or_storage);
-        }
-
-        out
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1255,14 +1157,6 @@ const HASHEDKEY_PART: PartFlags = 1;
 const ACCOUNT_PLAIN_PART: PartFlags = 2;
 const STORAGE_PLAIN_PART: PartFlags = 4;
 const HASH_PART: PartFlags = 8;
-
-type UpdateFlags = u8;
-
-const CODE_UPDATE: UpdateFlags = 1;
-const DELETE_UPDATE: UpdateFlags = 2;
-const BALANCE_UPDATE: UpdateFlags = 4;
-const NONCE_UPDATE: UpdateFlags = 8;
-const STORAGE_UPDATE: UpdateFlags = 16;
 
 fn make_compact_zero_byte(key: &[u8]) -> (u8, usize, usize) {
     let mut compact_zero_byte = 0_u8;
