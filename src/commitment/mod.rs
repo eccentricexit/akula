@@ -126,6 +126,37 @@ impl Cell {
         self.storage = storage;
     }
 
+    fn fill_from_upper_cell(&mut self, up_cell: Cell, depth: usize, depth_increment: usize) {
+        self.down_hashed_key.clear();
+        if up_cell.down_hashed_key.len() > depth_increment {
+            self.down_hashed_key
+                .try_extend_from_slice(&up_cell.down_hashed_key[depth_increment..])
+                .unwrap();
+        }
+        self.extension.clear();
+        if up_cell.extension.len() > depth_increment {
+            self.extension
+                .try_extend_from_slice(&up_cell.extension[depth_increment..])
+                .unwrap();
+        }
+        if depth <= 64 {
+            self.apk = up_cell.apk;
+            if up_cell.apk.is_some() {
+                self.balance = up_cell.balance;
+                self.nonce = up_cell.nonce;
+                self.code_hash = up_cell.code_hash;
+                self.extension = up_cell.extension;
+            }
+        } else {
+            self.apk = None;
+        }
+        self.spk = up_cell.spk;
+        if up_cell.spk.is_some() {
+            self.storage = up_cell.storage;
+        }
+        self.h = up_cell.h;
+    }
+
     // fn account_for_hashing(&self, storage_root_hash: H256) -> ArrayVec<u8, 128> {
     //     let mut buffer = ArrayVec::new();
 
@@ -215,6 +246,22 @@ impl Default for CellGrid {
 }
 
 impl CellGrid {
+    fn clear_row(&mut self, row: usize) {
+        for col in 0..16 {
+            let cell = self.grid_cell_mut(CellPosition { row, col });
+
+            cell.apk = None;
+            cell.spk = None;
+            cell.down_hashed_key.clear();
+            cell.extension.clear();
+            cell.h = None;
+            cell.nonce = 0;
+            cell.balance = U256::ZERO;
+            cell.code_hash = EMPTY_HASH;
+            cell.storage = None;
+        }
+    }
+
     #[inline(always)]
     fn cell(&self, cell_position: Option<CellPosition>) -> &Cell {
         if let Some(position) = cell_position {
@@ -267,34 +314,7 @@ impl CellGrid {
         let up_cell = self.cell_mut(up_cell).clone();
         let cell = self.cell_mut(cell);
 
-        cell.down_hashed_key.clear();
-        if up_cell.down_hashed_key.len() > depth_increment {
-            cell.down_hashed_key
-                .try_extend_from_slice(&up_cell.down_hashed_key[depth_increment..])
-                .unwrap();
-        }
-        cell.extension.clear();
-        if up_cell.extension.len() > depth_increment {
-            cell.extension
-                .try_extend_from_slice(&up_cell.extension[depth_increment..])
-                .unwrap();
-        }
-        if depth <= 64 {
-            cell.apk = up_cell.apk;
-            if up_cell.apk.is_some() {
-                cell.balance = up_cell.balance;
-                cell.nonce = up_cell.nonce;
-                cell.code_hash = up_cell.code_hash;
-                cell.extension = up_cell.extension;
-            }
-        } else {
-            cell.apk = None;
-        }
-        cell.spk = up_cell.spk;
-        if up_cell.spk.is_some() {
-            cell.storage = up_cell.storage;
-        }
-        cell.h = up_cell.h;
+        cell.fill_from_upper_cell(up_cell, depth, depth_increment)
     }
 
     fn fill_from_lower_cell(
@@ -687,93 +707,106 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
 
     #[instrument(skip(self))]
     fn unfold(&mut self, hashed_key: &[u8], unfolding: usize) -> anyhow::Result<()> {
-        // move |_| {
-        // trace!("Active rows = {}", self.active_rows);
+        trace!("Active rows = {}", self.active_rows);
 
-        // let up_cell: &mut Cell;
-        // let mut touched = false;
-        // let mut present = false;
-        // let mut col = 0;
-        // let mut upDepth = 0;
-        // let mut depth = 0;
-        // if self.activeRows == 0 {
-        //     let root = self.grid.cell_mut(None);
-        //     if self.rootChecked && root.h.is_none() && root.down_hashed_key.is_empty() {
-        //         // No unfolding for empty root
-        //         return Ok(());
-        //     }
-        //     up_cell = &root;
-        //     touched = self.root_touched;
-        //     present = self.root_present;
-        //     trace!("root, touched={}, present={}", touched, present);
-        // } else {
-        //     upDepth = self.depths[self.activeRows-1];
-        //     col = hashedKey[upDepth-1];
-        //     upCell = &hph.grid[hph.activeRows-1][col];
-        //     touched = hph.touchMap[hph.activeRows-1]&(uint16(1)<<col) != 0;
-        //     present = hph.afterMap[hph.activeRows-1]&(uint16(1)<<col) != 0;
-        //     trace!("upCell (%d, %x), touched %t, present %t\n", hph.activeRows-1, col, touched, present);
-        //     hph.currentKey[hph.currentKeyLen] = col;
-        //     hph.currentKeyLen+=1;
-        // }
-        // row := hph.activeRows;
-        //     self.grid.clear_row(row);
-        // hph.touchMap[row] = 0;
-        // hph.afterMap[row] = 0;
-        // hph.branchBefore[row] = false;
-        // if upCell.downHashedKey.is_empty() {
-        //     depth = upDepth + 1;
-        //     let _ = self.unfoldBranchNode(row, touched && !present /* deleted */, depth);
-        //     todo!()
-        // } else if upCell.downHashedKey.len() >= unfolding {
-        //     depth = upDepth + unfolding;
-        //     let nibble = upCell.downHashedKey[unfolding-1];
-        //     if touched {
-        //         hph.touchMap[row] = uint16(1) << nibble
-        //     }
-        //     if present {
-        //         hph.afterMap[row] = uint16(1) << nibble
-        //     }
-        //     cell := &hph.grid[row][nibble]
-        //     cell.fillFromUpperCell(upCell, depth, unfolding)
-        //     if hph.trace {
-        //         fmt.Printf("cell (%d, %x) depth=%d\n", row, nibble, depth)
-        //     }
-        //     if row >= 64 {
-        //         cell.apl = 0
-        //     }
-        //     if unfolding > 1 {
-        //         copy(hph.currentKey[hph.currentKeyLen:], upCell.downHashedKey[:unfolding-1])
-        //     }
-        //     hph.currentKeyLen += unfolding - 1
-        // } else {
-        //     // upCell.downHashedLen < unfolding
-        //     depth = upDepth + upCell.downHashedLen
-        //     nibble := upCell.downHashedKey[upCell.downHashedLen-1]
-        //     if touched {
-        //         hph.touchMap[row] = uint16(1) << nibble
-        //     }
-        //     if present {
-        //         hph.afterMap[row] = uint16(1) << nibble
-        //     }
-        //     cell := &hph.grid[row][nibble]
-        //     cell.fillFromUpperCell(upCell, depth, upCell.downHashedLen)
-        //     if hph.trace {
-        //         fmt.Printf("cell (%d, %x) depth=%d\n", row, nibble, depth)
-        //     }
-        //     if row >= 64 {
-        //         cell.apl = 0
-        //     }
-        //     if upCell.downHashedLen > 1 {
-        //         copy(hph.currentKey[hph.currentKeyLen:], upCell.downHashedKey[:upCell.downHashedLen-1])
-        //     }
-        //     hph.currentKeyLen += upCell.downHashedLen - 1
-        // }
-        // hph.depths[hph.activeRows] = depth
-        // hph.activeRows++
+        let touched;
+        let present;
+        let mut up_depth = 0;
+        let depth;
+        let up_cell;
+        if self.active_rows == 0 {
+            let root = self.grid.cell(None);
+            if self.root_checked && root.h.is_none() && root.down_hashed_key.is_empty() {
+                // No unfolding for empty root
+                return Ok(());
+            }
+            up_cell = root.clone();
+            touched = self.root_touched;
+            present = self.root_present;
+            trace!("root, touched={}, present={}", touched, present);
+        } else {
+            up_depth = self.depths[self.active_rows - 1];
+            let col = hashed_key[up_depth - 1];
+            up_cell = self
+                .grid
+                .grid_cell(CellPosition {
+                    row: self.active_rows - 1,
+                    col: col as usize,
+                })
+                .clone();
+            touched = self.touch_map[self.active_rows - 1] & (1_u16 << col as u16) != 0;
+            present = self.after_map[self.active_rows - 1] & (1_u16 << col as u16) != 0;
+            trace!(
+                "upCell ({}, {:02x}), touched {}, present {}",
+                self.active_rows - 1,
+                col,
+                touched,
+                present
+            );
+            self.current_key.push(col);
+        };
+        let row = self.active_rows;
+        self.grid.clear_row(row);
+        self.touch_map[row] = 0;
+        self.after_map[row] = 0;
+        self.branch_before[row] = false;
+        if up_cell.down_hashed_key.is_empty() {
+            depth = up_depth + 1;
+            self.unfold_branch_node(row, touched && !present, depth)?;
+        } else if up_cell.down_hashed_key.len() >= unfolding {
+            depth = up_depth + unfolding;
+            let nibble = up_cell.down_hashed_key[unfolding - 1];
+            if touched {
+                self.touch_map[row] = 1_u16 << nibble;
+            }
+            if present {
+                self.after_map[row] = 1_u16 << nibble;
+            }
+            let cell = self.grid.grid_cell_mut(CellPosition {
+                row,
+                col: nibble as usize,
+            });
+            cell.fill_from_upper_cell(up_cell.clone(), depth, unfolding);
+            trace!("cell ({}, {:02x}) depth={}", row, nibble, depth);
+            if row >= 64 {
+                cell.apk = None;
+            }
+            if unfolding > 1 {
+                self.current_key
+                    .try_extend_from_slice(&up_cell.down_hashed_key[..unfolding - 1])
+                    .unwrap();
+            }
+        } else {
+            // upCell.downHashedLen < unfolding
+            depth = up_depth + up_cell.down_hashed_key.len();
+            let nibble = *up_cell.down_hashed_key.last().unwrap();
+            if touched {
+                self.touch_map[row] = 1_u16 << nibble;
+            }
+            if present {
+                self.after_map[row] = 1_u16 << nibble;
+            }
+            let cell = self.grid.grid_cell_mut(CellPosition {
+                row,
+                col: nibble as usize,
+            });
+            cell.fill_from_upper_cell(up_cell.clone(), depth, up_cell.down_hashed_key.len());
+            trace!("cell ({}, {:02x}) depth={}", row, nibble, depth);
+            if row >= 64 {
+                cell.apk = None;
+            }
+            if up_cell.down_hashed_key.len() > 1 {
+                self.current_key
+                    .try_extend_from_slice(
+                        &up_cell.down_hashed_key[..up_cell.down_hashed_key.len() - 1],
+                    )
+                    .unwrap();
+            }
+        }
+        self.depths[self.active_rows] = depth;
+        self.active_rows += 1;
 
         Ok(())
-        // }
     }
 
     fn need_folding(&self, hashed_key: &[u8]) -> bool {
