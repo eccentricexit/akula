@@ -702,7 +702,71 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             .state
             .load_branch(&hex_to_compact(&self.current_key[..]))?;
 
-        todo!()
+        if !self.root_checked
+            && self.current_key.is_empty()
+            && branch_data.map(|b| b.is_empty()).unwrap_or(true)
+        {
+            // Special case - empty or deleted root
+            self.root_checked = true;
+            return Ok(());
+        }
+
+        let branch_data = branch_data.unwrap();
+        self.branch_before[row] = true;
+        let bitmap = u16::from_be_bytes(*array_ref!(branch_data, 0, 2));
+        let pos = 2;
+        if deleted {
+            // All cells come as deleted (touched but not present after)
+            self.after_map[row] = 0;
+            self.touch_map[row] = bitmap;
+        } else {
+            self.after_map[row] = bitmap;
+            self.touch_map[row] = 0;
+        }
+        // Loop iterating over the set bits of modMask
+        let mut bitset = bitmap;
+        while bitset != 0 {
+            let bit = bitset & 0_u16.overflowing_sub(bitset).0;
+            let nibble = bit.trailing_zeros();
+            let cell = self.grid.grid_cell_mut(CellPosition {
+                row,
+                col: nibble as usize,
+            });
+            let fieldBits = branch_data[pos];
+            pos += 1;
+            cell.fill_from_fields(branch_data, pos, fieldBits)
+                .with_context(format!(
+                    "prefix [{}], branchData[{}]",
+                    hex::encode(&self.current_key[..]),
+                    hex::encode(&branch_data)
+                ))?;
+            trace!(
+                "cell ({}, {:02x}) depth={}, hash=[{:?}], a=[{:?}], s=[{:?}], ex=[{}]",
+                row,
+                nibble,
+                depth,
+                cell.h,
+                cell.apk,
+                cell.spk,
+                hex::encode(&cell.extension)
+            );
+            if let Some(account) = cell.apk {
+                cell.fill_from_account(self.state.fetch_account(account)?.as_ref());
+                trace!(
+                    "accountFn[{:?}] return balance={}, nonce={}",
+                    account,
+                    &cell.balance,
+                    cell.nonce
+                );
+            }
+            if let Some((account, location)) = cell.spk {
+                cell.fill_from_storage(self.state.fetch_storage(account, location)?);
+            }
+            cell.derive_hashed_keys(depth, self.account_key_len)?;
+            bitset ^= bit;
+        }
+
+        Ok(())
     }
 
     #[instrument(skip(self))]
