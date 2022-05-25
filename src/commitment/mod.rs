@@ -2,7 +2,7 @@ pub mod rlputil;
 
 use self::rlputil::*;
 use crate::{crypto::keccak256, models::*, prefix_length, u256_to_h256, zeroless_view};
-use anyhow::{bail, format_err};
+use anyhow::{bail, format_err, Context};
 use array_macro::array;
 use arrayref::array_ref;
 use arrayvec::ArrayVec;
@@ -360,7 +360,7 @@ impl CellGrid {
     }
 }
 
-fn hash_key(plain_key: &[u8], hashed_key_offset: usize) -> ArrayVec<u8, 32> {
+fn hash_key(plain_key: &[u8], hashed_key_offset: usize) -> ArrayVec<u8, 65> {
     let hash_buf = keccak256(plain_key).0;
     let mut hash_buf = &hash_buf[hashed_key_offset / 2..];
     let mut dest = ArrayVec::new();
@@ -374,6 +374,89 @@ fn hash_key(plain_key: &[u8], hashed_key_offset: usize) -> ArrayVec<u8, 32> {
     }
 
     dest
+}
+
+impl Cell {
+    fn derive_hashed_keys(&mut self, depth: usize) -> anyhow::Result<()> {
+        let mut extra_len = 0_usize;
+        if self.apk.is_some() {
+            extra_len = 64_usize
+                .checked_sub(depth)
+                .ok_or_else(|| format_err!("account_plain_key present at depth > 64"))?;
+        }
+
+        if self.spk.is_some() {
+            if depth >= 64 {
+                extra_len = 128 - depth;
+            } else {
+                extra_len += 64;
+            }
+        }
+
+        if extra_len > 0 {
+            let orig = self.down_hashed_key.clone();
+            while self.down_hashed_key.len() < 128 {
+                self.down_hashed_key.push(0);
+            }
+            if !self.down_hashed_key.is_empty() {
+                let dst = &mut self.down_hashed_key[extra_len..];
+                let len = std::cmp::min(dst.len(), orig.len());
+                dst[..len].copy_from_slice(&orig[..len]);
+            }
+            self.down_hashed_key.truncate(orig.len() + extra_len);
+            let mut hashed_key_offset = 0;
+            let mut down_offset = 0;
+            if let Some(apk) = self.apk {
+                let k = hash_key(&apk[..], depth);
+                self.down_hashed_key[..k.len()].copy_from_slice(&k[..]);
+                down_offset = 64 - depth;
+            }
+            if let Some((_, location)) = self.spk {
+                if depth >= 64 {
+                    hashed_key_offset = depth - 64;
+                }
+                let dst = &mut self.down_hashed_key[down_offset..];
+                let k = hash_key(&location[..], hashed_key_offset);
+                dst[..k.len()].copy_from_slice(&k[..]);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn fill_from_fields(
+        &mut self,
+        data: &[u8],
+        mut pos: usize,
+        field_bits: PartFlags,
+    ) -> anyhow::Result<usize> {
+        if field_bits & HASHEDKEY_PART != 0 {
+            let (l, n) = uvarint(&data[pos..])
+                .ok_or_else(|| format_err!("value overflow for hashedKey len"))?;
+            if n == 0 {
+                bail!("buffer too small for hashedKey len");
+            }
+
+            pos += n;
+
+            let l = l as usize;
+
+            if data.len() < pos + l {
+                bail!("buffer too small for hashedKey");
+            }
+
+            self.down_hashed_key.clear();
+            self.extension.clear();
+
+            self.down_hashed_key
+                .try_extend_from_slice(&data[pos..pos + l])?;
+            self.extension.try_extend_from_slice(&data[pos..pos + l])?;
+
+            pos += l;
+        }
+
+        todo!()
+    }
 }
 
 pub trait State {
@@ -402,7 +485,6 @@ pub struct HexPatriciaHashed<'state, S: State> {
     branch_before: [bool; 128], // For each row, whether there was a branch node in the database loaded in unfold
     touch_map: [u16; 128], // For each row, bitmap of cells that were either present before modification, or modified or deleted
     after_map: [u16; 128], // For each row, bitmap of cells that were present after modification
-    account_key_len: usize,
     byte_array_writer: BytesMut,
 }
 
@@ -433,7 +515,6 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             branch_before: [false; 128],
             touch_map: [0; 128],
             after_map: [0; 128],
-            account_key_len: Default::default(),
             byte_array_writer: Default::default(),
         }
     }
@@ -536,16 +617,12 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
     fn compute_cell_hash(&mut self, pos: Option<CellPosition>, depth: usize) -> ArrayVec<u8, 33> {
         let cell = self.grid.cell_mut(pos);
         let mut storage_root = None;
-        if let Some((address, location)) = cell.spk {
-            let mut spk = [0; 52];
-            // ????
-            spk[..20].copy_from_slice(&address.0);
-            spk[20..].copy_from_slice(&location.0);
+        if let Some((_, location)) = cell.spk {
             let hashed_key_offset = depth.saturating_sub(64);
             let singleton = depth <= 64;
             cell.down_hashed_key.clear();
             cell.down_hashed_key
-                .try_extend_from_slice(&hash_key(&spk[self.account_key_len..], hashed_key_offset))
+                .try_extend_from_slice(&hash_key(&location[..], hashed_key_offset))
                 .unwrap();
             cell.down_hashed_key[64 - hashed_key_offset] = 16; // Add terminator
             if singleton {
@@ -704,7 +781,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
 
         if !self.root_checked
             && self.current_key.is_empty()
-            && branch_data.map(|b| b.is_empty()).unwrap_or(true)
+            && branch_data.as_ref().map(|b| b.is_empty()).unwrap_or(true)
         {
             // Special case - empty or deleted root
             self.root_checked = true;
@@ -714,7 +791,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         let branch_data = branch_data.unwrap();
         self.branch_before[row] = true;
         let bitmap = u16::from_be_bytes(*array_ref!(branch_data, 0, 2));
-        let pos = 2;
+        let mut pos = 2;
         if deleted {
             // All cells come as deleted (touched but not present after)
             self.after_map[row] = 0;
@@ -732,14 +809,16 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 row,
                 col: nibble as usize,
             });
-            let fieldBits = branch_data[pos];
+            let field_bits = branch_data[pos];
             pos += 1;
-            cell.fill_from_fields(branch_data, pos, fieldBits)
-                .with_context(format!(
-                    "prefix [{}], branchData[{}]",
-                    hex::encode(&self.current_key[..]),
-                    hex::encode(&branch_data)
-                ))?;
+            cell.fill_from_fields(&branch_data, pos, field_bits)
+                .with_context(|| {
+                    format!(
+                        "prefix [{}], branchData[{}]",
+                        hex::encode(&self.current_key[..]),
+                        hex::encode(&branch_data)
+                    )
+                })?;
             trace!(
                 "cell ({}, {:02x}) depth={}, hash=[{:?}], a=[{:?}], s=[{:?}], ex=[{}]",
                 row,
@@ -762,7 +841,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             if let Some((account, location)) = cell.spk {
                 cell.fill_from_storage(self.state.fetch_storage(account, location)?);
             }
-            cell.derive_hashed_keys(depth, self.account_key_len)?;
+            cell.derive_hashed_keys(depth)?;
             bitset ^= bit;
         }
 
