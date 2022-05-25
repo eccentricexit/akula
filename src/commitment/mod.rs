@@ -9,12 +9,9 @@ use array_macro::array;
 use arrayref::array_ref;
 use arrayvec::ArrayVec;
 use bytes::{BufMut, BytesMut};
-use derive_more::From;
 use sha3::{Digest, Keccak256};
 use std::{
-    collections::HashMap,
-    ops::{Generator, GeneratorState},
-    pin::Pin,
+    collections::{BTreeMap, BTreeSet, HashMap},
     ptr::addr_of_mut,
 };
 use tracing::*;
@@ -350,13 +347,8 @@ fn hash_key(plain_key: &[u8], hashed_key_offset: usize) -> ArrayVec<u8, 32> {
 
 pub trait State {
     fn load_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
-    fn fetch_account(&mut self, address: Address, cell: &mut Cell) -> anyhow::Result<()>;
-    fn fetch_storage(
-        &mut self,
-        address: Address,
-        location: H256,
-        cell: &mut Cell,
-    ) -> anyhow::Result<()>;
+    fn fetch_account(&mut self, address: Address) -> anyhow::Result<Option<Account>>;
+    fn fetch_storage(&mut self, address: Address, location: H256) -> anyhow::Result<Option<U256>>;
 }
 
 /// HexPatriciaHashed implements commitment based on patricia merkle tree with radix 16,
@@ -485,9 +477,8 @@ impl Update {
 
 #[derive(Clone, Debug)]
 pub struct ProcessUpdateArg {
-    pub hashed_key: H256,
-    pub plain_key: Vec<u8>,
-    pub update: Update,
+    pub account_changed: bool,
+    pub changed_storage: BTreeSet<H256>,
 }
 
 impl<'state, S: State> HexPatriciaHashed<'state, S> {
@@ -516,26 +507,66 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
 
     pub fn process_updates(
         &mut self,
-        updates: Vec<ProcessUpdateArg>,
+        updates: BTreeMap<Address, ProcessUpdateArg>,
     ) -> anyhow::Result<HashMap<Vec<u8>, Vec<u8>>> {
         let mut branch_node_updates = HashMap::new();
 
-        for ProcessUpdateArg {
-            hashed_key,
-            plain_key,
-            update,
-        } in updates
+        #[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq, Hash)]
+        struct PlainKey {
+            address: Address,
+            storage: Option<H256>,
+        }
+
+        let mut changed_keys = BTreeMap::<PlainKey, ArrayVec<u8, 64>>::new();
+
+        for (
+            address,
+            ProcessUpdateArg {
+                account_changed,
+                changed_storage,
+            },
+        ) in updates
         {
+            let hashed_address = keccak256(address);
+
+            if account_changed {
+                let mut v = ArrayVec::new();
+                v.try_extend_from_slice(&hashed_address[..]).unwrap();
+                changed_keys.insert(
+                    PlainKey {
+                        address,
+                        storage: None,
+                    },
+                    v,
+                );
+            }
+
+            for location in changed_storage {
+                let hashed_location = keccak256(address);
+
+                let mut v = ArrayVec::new();
+                v.try_extend_from_slice(&hashed_address[..]).unwrap();
+                v.try_extend_from_slice(&hashed_location[..]).unwrap();
+                changed_keys.insert(
+                    PlainKey {
+                        address,
+                        storage: Some(location),
+                    },
+                    v,
+                );
+            }
+        }
+
+        for (plain_key, hashed_key) in changed_keys {
             trace!(
-                "plain_key={:?}, hashed_key={:?}, current_key={:?}, update={:?}",
+                "plain_key={:?}, hashed_key={:?}, current_key={:?}",
                 plain_key,
-                hashed_key,
+                hex::encode(&hashed_key),
                 hex::encode(&self.current_key),
-                update
             );
 
             // Keep folding until the current_key is the prefix of the key we modify
-            while self.need_folding(hashed_key) {
+            while self.need_folding(&hashed_key[..]) {
                 let (branch_node_update, update_key) = self.fold();
                 if let Some(branch_node_update) = branch_node_update {
                     branch_node_updates.insert(update_key, branch_node_update);
@@ -549,40 +580,20 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                     break;
                 }
 
-                self.unfold(hashed_key, unfolding)?;
+                self.unfold(&hashed_key[..], unfolding)?;
             }
 
             // Update the cell
-            if update.flags == DELETE_UPDATE {
-                self.delete_cell(hashed_key);
+            if let Some(location) = plain_key.storage {
+                if let Some(value) = self.state.fetch_storage(plain_key.address, location)? {
+                    self.update_storage(plain_key.address, location, hashed_key, value);
+                } else {
+                    self.delete_cell(hashed_key);
+                }
+            } else if let Some(account) = self.state.fetch_account(plain_key.address)? {
+                self.update_account(plain_key.address, hashed_key, account);
             } else {
-                if update.flags & BALANCE_UPDATE != 0 {
-                    self.update_balance(
-                        Address::from_slice(&plain_key),
-                        hashed_key,
-                        update.balance,
-                    );
-                }
-                if update.flags & NONCE_UPDATE != 0 {
-                    self.update_nonce(Address::from_slice(&plain_key), hashed_key, update.nonce);
-                }
-                if update.flags & CODE_UPDATE != 0 {
-                    self.update_code(
-                        Address::from_slice(&plain_key),
-                        hashed_key,
-                        H256::from_slice(&update.code_hash_or_storage[..]),
-                    );
-                }
-                if update.flags & STORAGE_UPDATE != 0 {
-                    self.update_storage(
-                        (
-                            Address::from_slice(&plain_key[..ADDRESS_LENGTH]),
-                            H256::from_slice(&plain_key[ADDRESS_LENGTH..]),
-                        ),
-                        hashed_key,
-                        U256::from_be_bytes(static_left_pad(&update.code_hash_or_storage[..])),
-                    );
-                }
+                self.delete_cell(hashed_key);
             }
         }
 
@@ -769,7 +780,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
     }
 
     #[instrument(skip(self))]
-    fn unfold(&mut self, hashed_key: H256, unfolding: usize) -> anyhow::Result<()> {
+    fn unfold(&mut self, hashed_key: &[u8], unfolding: usize) -> anyhow::Result<()> {
         // move |_| {
         // trace!("Active rows = {}", self.active_rows);
 
@@ -859,7 +870,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         // }
     }
 
-    fn need_folding(&self, hashed_key: H256) -> bool {
+    fn need_folding(&self, hashed_key: &[u8]) -> bool {
         !hashed_key[..].starts_with(&self.current_key[..])
     }
 
@@ -1120,7 +1131,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
     }
 
     #[instrument(skip(self))]
-    fn delete_cell(&mut self, hashed_key: H256) {
+    fn delete_cell(&mut self, hashed_key: ArrayVec<u8, 64>) {
         trace!("Active rows = {}", self.active_rows);
         let cell: &mut Cell;
         if self.active_rows == 0 {
@@ -1156,7 +1167,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
     }
 
     #[instrument(skip(self))]
-    fn update_account(&mut self, plain_key: Address, hashed_key: H256) -> &mut Cell {
+    fn update_account(&mut self, address: Address, hashed_key: ArrayVec<u8, 64>, account: Account) {
         if self.active_rows == 0 {
             self.active_rows += 1;
         }
@@ -1181,31 +1192,20 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 hex::encode(&cell.down_hashed_key[..])
             );
         }
-        cell.apk = Some(plain_key);
-
-        cell
+        cell.apk = Some(address);
+        cell.nonce = account.nonce;
+        cell.balance = account.balance;
+        cell.code_hash = account.code_hash;
     }
 
     #[instrument(skip(self))]
-    fn update_balance(&mut self, plain_key: Address, hashed_key: H256, balance: U256) {
-        trace!("Active rows = {}", self.active_rows);
-        self.update_account(plain_key, hashed_key).balance = balance;
-    }
-
-    #[instrument(skip(self))]
-    fn update_code(&mut self, plain_key: Address, hashed_key: H256, code_hash: H256) {
-        trace!("Active rows = {}", self.active_rows);
-        self.update_account(plain_key, hashed_key).code_hash = code_hash;
-    }
-
-    #[instrument(skip(self))]
-    fn update_nonce(&mut self, plain_key: Address, hashed_key: H256, nonce: u64) {
-        trace!("Active rows = {}", self.active_rows);
-        self.update_account(plain_key, hashed_key).nonce = nonce;
-    }
-
-    #[instrument(skip(self))]
-    fn update_storage(&mut self, plain_key: (Address, H256), hashed_key: H256, value: U256) {
+    fn update_storage(
+        &mut self,
+        address: Address,
+        location: H256,
+        hashed_key: ArrayVec<u8, 64>,
+        value: U256,
+    ) {
         trace!("Active rows = {}", self.active_rows);
         if self.active_rows == 0 {
             self.active_rows += 1;
@@ -1240,7 +1240,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 hex::encode(&cell.down_hashed_key[..])
             );
         }
-        cell.spk = Some(plain_key);
+        cell.spk = Some((address, location));
         cell.storage = Some(value);
     }
 }
@@ -1579,8 +1579,13 @@ fn keybytes_to_hex(s: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Context;
-    use std::collections::{hash_map::Entry, HashSet};
+    use std::collections::HashSet;
+
+    #[derive(Debug, Default)]
+    struct AccountUpdate {
+        account: Option<Account>,
+        storage: HashMap<H256, Option<U256>>,
+    }
 
     #[derive(Debug, Default)]
     struct MockState {
@@ -1590,188 +1595,6 @@ mod tests {
         sm: HashMap<(Address, H256), Vec<u8>>,
         /// Backbone of the commitments
         cm: HashMap<Vec<u8>, Vec<u8>>,
-    }
-
-    impl State for MockState {
-        fn load_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-            Ok(self.cm.get(&prefix).map(|v| {
-                v[2..] // Skip touchMap, but keep afterMap
-                    .to_vec()
-            }))
-        }
-
-        fn fetch_account(&mut self, address: Address, cell: &mut Cell) -> anyhow::Result<()> {
-            let ex_bytes = &self.am[&address];
-
-            let (ex, pos) = Update::decode(ex_bytes, 0).unwrap();
-
-            assert_eq!(
-                pos,
-                ex_bytes.len(),
-                "accountFn key [{}] leftover bytes in [{}], consumed {:02x}",
-                hex::encode(address),
-                hex::encode(ex_bytes),
-                pos
-            );
-            assert_eq!(
-                ex.flags & STORAGE_UPDATE,
-                0,
-                "accountFn reading storage item for key [{}]",
-                hex::encode(&address)
-            );
-            assert_eq!(
-                ex.flags & DELETE_UPDATE,
-                0,
-                "accountFn reading deleted account for key [{}]",
-                hex::encode(&address)
-            );
-            if ex.flags & BALANCE_UPDATE != 0 {
-                cell.balance = ex.balance;
-            } else {
-                cell.balance = U256::ZERO;
-            }
-            if ex.flags & NONCE_UPDATE != 0 {
-                cell.nonce = ex.nonce;
-            } else {
-                cell.nonce = 0;
-            }
-            if ex.flags & CODE_UPDATE != 0 {
-                cell.code_hash = H256::from_slice(&ex.code_hash_or_storage[..]);
-            } else {
-                cell.code_hash = EMPTY_HASH;
-            }
-
-            Ok(())
-        }
-
-        fn fetch_storage(
-            &mut self,
-            address: Address,
-            location: H256,
-            cell: &mut Cell,
-        ) -> anyhow::Result<()> {
-            let plain_key = (address, location);
-            let ex_bytes = &self.sm[&plain_key];
-
-            let (ex, pos) = Update::decode(ex_bytes, 0)
-                .with_context(|| {
-                    format!(
-                        "storage decode existing [{:?}], bytes: [{}]",
-                        plain_key,
-                        hex::encode(&ex_bytes)
-                    )
-                })
-                .unwrap();
-            assert_eq!(
-                pos,
-                ex_bytes.len(),
-                "storageFn key [{:?}] leftover bytes in [{}], comsumed {:02x}",
-                plain_key,
-                hex::encode(ex_bytes),
-                pos
-            );
-            assert_eq!(
-                ex.flags & BALANCE_UPDATE,
-                0,
-                "storageFn reading balance for key [{:?}]",
-                plain_key
-            );
-            assert_eq!(
-                ex.flags & NONCE_UPDATE,
-                0,
-                "storageFn reading nonce for key [{:?}]",
-                plain_key
-            );
-            assert_eq!(
-                ex.flags & CODE_UPDATE,
-                0,
-                "storageFn reading code hash for key [{:?}]",
-                plain_key
-            );
-            assert_eq!(
-                ex.flags & DELETE_UPDATE,
-                0,
-                "storageFn reading deleted item for key [{:?}]",
-                plain_key
-            );
-            if ex.flags & STORAGE_UPDATE != 0 {
-                cell.storage = Some(U256::from_be_bytes(static_left_pad(
-                    &ex.code_hash_or_storage,
-                )));
-            } else {
-                cell.storage = None;
-            }
-
-            Ok(())
-        }
-    }
-
-    impl MockState {
-        fn apply_plain_updates(
-            &mut self,
-            plain_keys: Vec<Vec<u8>>,
-            updates: Vec<Update>,
-        ) -> anyhow::Result<()> {
-            for (key, update) in plain_keys.into_iter().zip(updates) {
-                if update.flags & DELETE_UPDATE != 0 {
-                    self.sm.remove(&key);
-                } else {
-                    match self.sm.entry(key.clone()) {
-                        Entry::Occupied(mut entry) => {
-                            let ex_bytes = entry.get();
-                            let (mut ex, pos) = Update::decode(ex_bytes, 0).with_context(|| {
-                                format!(
-                                    "applyPlainUpdates decode existing [{}], bytes: [{}]",
-                                    hex::encode(&key),
-                                    hex::encode(ex_bytes)
-                                )
-                            })?;
-                            if pos != ex_bytes.len() {
-                                bail!("applyPlainUpdates key [{}] leftover bytes in [{}], comsumed {}", hex::encode(&key), hex::encode(ex_bytes), pos);
-                            }
-                            if update.flags & BALANCE_UPDATE != 0 {
-                                ex.flags |= BALANCE_UPDATE;
-                                ex.balance = update.balance;
-                            }
-                            if update.flags & NONCE_UPDATE != 0 {
-                                ex.flags |= NONCE_UPDATE;
-                                ex.nonce = update.nonce;
-                            }
-                            if update.flags & CODE_UPDATE != 0 || update.flags & STORAGE_UPDATE != 0
-                            {
-                                if update.flags & CODE_UPDATE != 0 {
-                                    ex.flags |= CODE_UPDATE;
-                                }
-                                if update.flags & STORAGE_UPDATE != 0 {
-                                    ex.flags |= STORAGE_UPDATE;
-                                }
-
-                                ex.code_hash_or_storage = update.code_hash_or_storage;
-                            }
-                            entry.insert(ex.encode());
-                        }
-                        Entry::Vacant(entry) => {
-                            entry.insert(update.encode());
-                        }
-                    }
-                }
-            }
-
-            Ok(())
-        }
-
-        fn apply_branch_node_updates(&mut self, updates: HashMap<Vec<u8>, Vec<u8>>) {
-            for (key, update) in updates {
-                match self.cm.entry(key) {
-                    Entry::Occupied(mut pre) => {
-                        pre.insert(merge_hex_branches(pre.get(), &update).unwrap());
-                    }
-                    Entry::Vacant(entry) => {
-                        entry.insert(update);
-                    }
-                }
-            }
-        }
     }
 
     /// Collects updates to the state
