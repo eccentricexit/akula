@@ -1254,12 +1254,19 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             self.active_rows += 1;
         }
         let row = self.active_rows - 1;
-        let depth = self.depths[self.active_rows - 1];
+        let depth = self.depths[row];
         let col = hashed_key[self.current_key.len()] as usize;
-        let cell = self.grid.cell_mut(Some(CellPosition { row, col }));
+        let cell = self.grid.grid_cell_mut(CellPosition { row, col });
         self.touch_map[row] |= 1_u16 << col as u16;
         self.after_map[row] |= 1_u16 << col as u16;
-        trace!("Setting ({}, {:02x}), depth={}", row, col, depth);
+        trace!(
+            "Setting ({}, {:02x}), touch_map[{}]={:#018b}, depth={}",
+            row,
+            col,
+            row,
+            self.touch_map[row],
+            depth
+        );
         if cell.down_hashed_key.is_empty() {
             cell.down_hashed_key
                 .try_extend_from_slice(&hashed_key[depth..])
@@ -1292,20 +1299,18 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         if self.active_rows == 0 {
             self.active_rows += 1;
         }
-        let depth = self.depths[self.active_rows - 1];
+        let row = self.active_rows - 1;
+        let depth = self.depths[row];
         let col = hashed_key[self.current_key.len()] as usize;
-        let cell = self.grid.cell_mut(Some(CellPosition {
-            row: self.active_rows - 1,
-            col,
-        }));
-        self.touch_map[self.active_rows - 1] |= 1_u16 << col as u16;
-        self.after_map[self.active_rows - 1] |= 1_u16 << col as u16;
+        let cell = self.grid.grid_cell_mut(CellPosition { row, col });
+        self.touch_map[row] |= 1_u16 << col as u16;
+        self.after_map[row] |= 1_u16 << col as u16;
         trace!(
             "Setting ({}, {:02x}), touch_map[{}]={:#018b}, depth={}",
-            self.active_rows - 1,
+            row,
             col,
-            self.active_rows - 1,
-            self.touch_map[self.active_rows - 1],
+            row,
+            self.touch_map[row],
             depth
         );
         if cell.down_hashed_key.is_empty() {
