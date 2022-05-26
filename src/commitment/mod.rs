@@ -606,8 +606,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
 
             // Keep folding until the current_key is the prefix of the key we modify
             while self.need_folding(&hashed_key[..]) {
-                let (branch_node_update, update_key) = self.fold();
-                if let Some(branch_node_update) = branch_node_update {
+                if let (Some(branch_node_update), update_key) = self.fold() {
                     branch_node_updates.insert(update_key, branch_node_update);
                 }
             }
@@ -1047,11 +1046,12 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                         self.after_map[row - 1] &= !(1_u16 << col);
                     }
                 }
-                self.grid.cell_mut(up_cell).h = None;
-                self.grid.cell_mut(up_cell).apk = None;
-                self.grid.cell_mut(up_cell).spk = None;
-                self.grid.cell_mut(up_cell).extension.clear();
-                self.grid.cell_mut(up_cell).down_hashed_key.clear();
+                let up_cell = self.grid.cell_mut(up_cell);
+                up_cell.h = None;
+                up_cell.apk = None;
+                up_cell.spk = None;
+                up_cell.extension.clear();
+                up_cell.down_hashed_key.clear();
                 if self.branch_before[row] {
                     let mut bitmap_buf = Vec::with_capacity(2 + 2);
                     bitmap_buf.extend_from_slice(&self.touch_map[row].to_be_bytes()); // touch_map
@@ -1077,19 +1077,19 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                     }
                 }
                 let nibble = self.after_map[row].trailing_zeros().try_into().unwrap();
-                self.grid.cell_mut(up_cell).extension.clear();
-                {
-                    let low_cell = self
-                        .grid
-                        .grid_cell(CellPosition { row, col: nibble })
-                        .clone();
-                    self.grid.cell_mut(up_cell).fill_from_lower_cell(
-                        low_cell,
-                        depth,
-                        &self.current_key[up_depth..],
-                        nibble,
-                    );
-                }
+                let low_cell = self
+                    .grid
+                    .grid_cell(CellPosition { row, col: nibble })
+                    .clone();
+                let up_cell = self.grid.cell_mut(up_cell);
+                up_cell.extension.clear();
+                up_cell.fill_from_lower_cell(
+                    low_cell,
+                    depth,
+                    &self.current_key[up_depth..],
+                    nibble,
+                );
+
                 // Delete if it existed
                 if self.branch_before[row] {
                     let mut bitmap_buf = Vec::with_capacity(2 + 2);
@@ -1271,7 +1271,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             let col = hashed_key[self.current_key.len()] as usize;
             cell = self.grid.cell_mut(Some(CellPosition { row, col }));
             if self.after_map[row] & 1_u16 << col != 0 {
-                // Prevent "spurios deletions", i.e. deletion of absent items
+                // Prevent "spurious deletions", i.e. deletion of absent items
                 self.touch_map[row] |= 1_u16 << col as u16;
                 self.after_map[row] &= !(1_u16 << col as u16);
                 trace!("Setting ({}, {:02x})", row, col);
