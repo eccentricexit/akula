@@ -2,7 +2,7 @@ pub mod rlputil;
 
 use self::rlputil::*;
 use crate::{crypto::keccak256, models::*, prefix_length, u256_to_h256, zeroless_view};
-use anyhow::{bail, format_err, Context};
+use anyhow::{bail, ensure, format_err, Context};
 use array_macro::array;
 use arrayref::array_ref;
 use arrayvec::ArrayVec;
@@ -430,11 +430,11 @@ impl Cell {
         mut pos: usize,
         field_bits: PartFlags,
     ) -> anyhow::Result<usize> {
-        if field_bits & HASHEDKEY_PART != 0 {
-            let (l, n) = uvarint(&data[pos..])
-                .ok_or_else(|| format_err!("value overflow for hashedKey len"))?;
+        fn extract_length(data: &[u8], mut pos: usize) -> anyhow::Result<(usize, usize)> {
+            let (l, n) =
+                uvarint(&data[pos..]).ok_or_else(|| format_err!("value overflow for len"))?;
             if n == 0 {
-                bail!("buffer too small for hashedKey len");
+                bail!("buffer too small for len");
             }
 
             pos += n;
@@ -442,20 +442,69 @@ impl Cell {
             let l = l as usize;
 
             if data.len() < pos + l {
-                bail!("buffer too small for hashedKey");
+                bail!("buffer too small for value");
             }
 
-            self.down_hashed_key.clear();
-            self.extension.clear();
-
-            self.down_hashed_key
-                .try_extend_from_slice(&data[pos..pos + l])?;
-            self.extension.try_extend_from_slice(&data[pos..pos + l])?;
-
-            pos += l;
+            Ok((pos, l))
         }
 
-        todo!()
+        self.down_hashed_key.clear();
+        self.extension.clear();
+        if field_bits & HASHEDKEY_PART != 0 {
+            let l;
+            (pos, l) = extract_length(data, pos)?;
+
+            if l > 0 {
+                self.down_hashed_key
+                    .try_extend_from_slice(&data[pos..pos + l])?;
+                self.extension.try_extend_from_slice(&data[pos..pos + l])?;
+
+                pos += l;
+            }
+        }
+
+        self.apk = None;
+        if field_bits & ACCOUNT_PLAIN_PART != 0 {
+            let l;
+            (pos, l) = extract_length(data, pos)?;
+
+            if l > 0 {
+                ensure!(l == ADDRESS_LENGTH);
+                self.apk = Some(Address::from_slice(&data[pos..pos + l]));
+                pos += l;
+            }
+        }
+
+        self.spk = None;
+        if field_bits & STORAGE_PLAIN_PART != 0 {
+            let l;
+            (pos, l) = extract_length(data, pos)?;
+
+            if l > 0 {
+                ensure!(l == ADDRESS_LENGTH + KECCAK_LENGTH);
+                self.spk = Some((
+                    Address::from_slice(&data[pos..pos + ADDRESS_LENGTH]),
+                    H256::from_slice(
+                        &data[pos + ADDRESS_LENGTH..pos + ADDRESS_LENGTH + KECCAK_LENGTH],
+                    ),
+                ));
+                pos += l;
+            }
+        }
+
+        self.h = None;
+        if field_bits & HASH_PART != 0 {
+            let l;
+            (pos, l) = extract_length(data, pos)?;
+
+            if l > 0 {
+                ensure!(l == KECCAK_LENGTH);
+                self.h = Some(H256::from_slice(&data[pos..pos + KECCAK_LENGTH]));
+                pos += l;
+            }
+        }
+
+        Ok(pos)
     }
 }
 
@@ -1249,52 +1298,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
     }
 
     #[instrument(skip(self))]
-    fn update_account(&mut self, address: Address, hashed_key: ArrayVec<u8, 64>, account: Account) {
-        if self.active_rows == 0 {
-            self.active_rows += 1;
-        }
-        let row = self.active_rows - 1;
-        let depth = self.depths[row];
-        let col = hashed_key[self.current_key.len()] as usize;
-        let cell = self.grid.grid_cell_mut(CellPosition { row, col });
-        self.touch_map[row] |= 1_u16 << col as u16;
-        self.after_map[row] |= 1_u16 << col as u16;
-        trace!(
-            "Setting ({}, {:02x}), touch_map[{}]={:#018b}, depth={}",
-            row,
-            col,
-            row,
-            self.touch_map[row],
-            depth
-        );
-        if cell.down_hashed_key.is_empty() {
-            cell.down_hashed_key
-                .try_extend_from_slice(&hashed_key[depth..])
-                .unwrap();
-            trace!(
-                "Set down_hashed_key=[{}]",
-                hex::encode(&cell.down_hashed_key[..])
-            );
-        } else {
-            trace!(
-                "Left down_hashed_key=[{}]",
-                hex::encode(&cell.down_hashed_key[..])
-            );
-        }
-        cell.apk = Some(address);
-        cell.nonce = account.nonce;
-        cell.balance = account.balance;
-        cell.code_hash = account.code_hash;
-    }
-
-    #[instrument(skip(self))]
-    fn update_storage(
-        &mut self,
-        address: Address,
-        location: H256,
-        hashed_key: ArrayVec<u8, 64>,
-        value: U256,
-    ) {
+    fn update_cell(&mut self, hashed_key: ArrayVec<u8, 64>) -> &mut Cell {
         trace!("Active rows = {}", self.active_rows);
         if self.active_rows == 0 {
             self.active_rows += 1;
@@ -1327,6 +1331,30 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 hex::encode(&cell.down_hashed_key[..])
             );
         }
+
+        cell
+    }
+
+    #[instrument(skip(self))]
+    fn update_account(&mut self, address: Address, hashed_key: ArrayVec<u8, 64>, account: Account) {
+        let cell = self.update_cell(hashed_key);
+
+        cell.apk = Some(address);
+        cell.nonce = account.nonce;
+        cell.balance = account.balance;
+        cell.code_hash = account.code_hash;
+    }
+
+    #[instrument(skip(self))]
+    fn update_storage(
+        &mut self,
+        address: Address,
+        location: H256,
+        hashed_key: ArrayVec<u8, 64>,
+        value: U256,
+    ) {
+        let cell = self.update_cell(hashed_key);
+
         cell.spk = Some((address, location));
         cell.storage = Some(value);
     }
