@@ -2,7 +2,7 @@ pub mod rlputil;
 
 use self::rlputil::*;
 use crate::{crypto::keccak256, models::*, prefix_length, u256_to_h256, zeroless_view};
-use anyhow::{bail, ensure, format_err, Context};
+use anyhow::{bail, ensure, format_err};
 use array_macro::array;
 use arrayref::array_ref;
 use arrayvec::ArrayVec;
@@ -392,12 +392,70 @@ impl Cell {
         Ok(())
     }
 
-    fn fill_from_fields(
-        &mut self,
-        data: &[u8],
-        mut pos: usize,
-        field_bits: PartFlags,
-    ) -> anyhow::Result<usize> {
+    fn fill_from_fields(&mut self, data: &CellPayload) {
+        self.down_hashed_key.clear();
+        self.extension.clear();
+        if let Some(extension) = &data.extension {
+            self.down_hashed_key
+                .try_extend_from_slice(&extension[..])
+                .unwrap();
+            self.extension
+                .try_extend_from_slice(&extension[..])
+                .unwrap();
+        }
+
+        self.apk = data.apk;
+        self.spk = data.spk;
+        self.h = data.h;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CellPayload {
+    pub field_bits: PartFlags,
+    pub extension: Option<ArrayVec<u8, 64>>,
+    pub apk: Option<Address>,
+    pub spk: Option<(Address, H256)>,
+    pub h: Option<H256>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BranchData {
+    pub touch_map: u16,
+    pub after_map: u16,
+    pub payload: Vec<CellPayload>,
+}
+
+impl BranchData {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + 2);
+
+        out.extend_from_slice(&self.touch_map.to_be_bytes());
+        out.extend_from_slice(&self.after_map.to_be_bytes());
+
+        for payload in &self.payload {
+            out.push(payload.field_bits);
+            if let Some(extension) = &payload.extension {
+                encode_slice(&mut out, &extension[..]);
+            }
+            if let Some(apk) = &payload.apk {
+                encode_slice(&mut out, &apk[..]);
+            }
+            if let Some((addr, location)) = &payload.spk {
+                let mut spk = [0; H160::len_bytes() + H256::len_bytes()];
+                spk[..H160::len_bytes()].copy_from_slice(&addr.0);
+                spk[H160::len_bytes()..].copy_from_slice(&location.0);
+                encode_slice(&mut out, &spk[..]);
+            }
+            if let Some(h) = &payload.h {
+                encode_slice(&mut out, &h[..]);
+            }
+        }
+
+        out
+    }
+
+    pub fn decode(buf: &[u8], mut pos: usize) -> anyhow::Result<(Self, usize)> {
         fn extract_length(data: &[u8], mut pos: usize) -> anyhow::Result<(usize, usize)> {
             let (l, n) =
                 uvarint(&data[pos..]).ok_or_else(|| format_err!("value overflow for len"))?;
@@ -416,68 +474,94 @@ impl Cell {
             Ok((pos, l))
         }
 
-        self.down_hashed_key.clear();
-        self.extension.clear();
-        if field_bits & HASHEDKEY_PART != 0 {
-            let l;
-            (pos, l) = extract_length(data, pos)?;
+        ensure!(buf.len() >= pos + 4);
+        let touch_map = u16::from_be_bytes(*array_ref!(buf, pos, 2));
+        pos += 2;
 
-            if l > 0 {
-                self.down_hashed_key
-                    .try_extend_from_slice(&data[pos..pos + l])?;
-                self.extension.try_extend_from_slice(&data[pos..pos + l])?;
+        let after_map = u16::from_be_bytes(*array_ref!(buf, pos, 2));
+        pos += 2;
 
-                pos += l;
+        let mut payload = vec![];
+        while buf.len() != pos {
+            let field_bits = buf[pos];
+            pos += 1;
+
+            let mut extension = None;
+            if field_bits & HASHEDKEY_PART != 0 {
+                let l;
+                (pos, l) = extract_length(buf, pos)?;
+
+                if l > 0 {
+                    let mut v = ArrayVec::new();
+                    v.try_extend_from_slice(&buf[pos..pos + l])?;
+                    extension = Some(v);
+                    pos += l;
+                }
             }
+
+            let mut apk = None;
+            if field_bits & ACCOUNT_PLAIN_PART != 0 {
+                let l;
+                (pos, l) = extract_length(buf, pos)?;
+
+                if l > 0 {
+                    ensure!(l == ADDRESS_LENGTH);
+                    apk = Some(Address::from_slice(&buf[pos..pos + l]));
+                    pos += l;
+                }
+            }
+
+            let mut spk = None;
+            if field_bits & STORAGE_PLAIN_PART != 0 {
+                let l;
+                (pos, l) = extract_length(buf, pos)?;
+
+                if l > 0 {
+                    ensure!(l == ADDRESS_LENGTH + KECCAK_LENGTH);
+                    spk = Some((
+                        Address::from_slice(&buf[pos..pos + ADDRESS_LENGTH]),
+                        H256::from_slice(
+                            &buf[pos + ADDRESS_LENGTH..pos + ADDRESS_LENGTH + KECCAK_LENGTH],
+                        ),
+                    ));
+                    pos += l;
+                }
+            }
+
+            let mut h = None;
+            if field_bits & HASH_PART != 0 {
+                let l;
+                (pos, l) = extract_length(buf, pos)?;
+
+                if l > 0 {
+                    ensure!(l == KECCAK_LENGTH);
+                    h = Some(H256::from_slice(&buf[pos..pos + KECCAK_LENGTH]));
+                    pos += l;
+                }
+            }
+
+            payload.push(CellPayload {
+                field_bits,
+                extension,
+                apk,
+                spk,
+                h,
+            });
         }
 
-        self.apk = None;
-        if field_bits & ACCOUNT_PLAIN_PART != 0 {
-            let l;
-            (pos, l) = extract_length(data, pos)?;
-
-            if l > 0 {
-                ensure!(l == ADDRESS_LENGTH);
-                self.apk = Some(Address::from_slice(&data[pos..pos + l]));
-                pos += l;
-            }
-        }
-
-        self.spk = None;
-        if field_bits & STORAGE_PLAIN_PART != 0 {
-            let l;
-            (pos, l) = extract_length(data, pos)?;
-
-            if l > 0 {
-                ensure!(l == ADDRESS_LENGTH + KECCAK_LENGTH);
-                self.spk = Some((
-                    Address::from_slice(&data[pos..pos + ADDRESS_LENGTH]),
-                    H256::from_slice(
-                        &data[pos + ADDRESS_LENGTH..pos + ADDRESS_LENGTH + KECCAK_LENGTH],
-                    ),
-                ));
-                pos += l;
-            }
-        }
-
-        self.h = None;
-        if field_bits & HASH_PART != 0 {
-            let l;
-            (pos, l) = extract_length(data, pos)?;
-
-            if l > 0 {
-                ensure!(l == KECCAK_LENGTH);
-                self.h = Some(H256::from_slice(&data[pos..pos + KECCAK_LENGTH]));
-                pos += l;
-            }
-        }
-
-        Ok(pos)
+        Ok((
+            Self {
+                touch_map,
+                after_map,
+                payload,
+            },
+            pos,
+        ))
     }
 }
 
 pub trait State {
-    fn load_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
+    fn load_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<BranchData>>;
     fn fetch_account(&mut self, address: Address) -> anyhow::Result<Option<Account>>;
     fn fetch_storage(&mut self, address: Address, location: H256) -> anyhow::Result<Option<U256>>;
 }
@@ -543,7 +627,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
     pub fn process_updates(
         &mut self,
         updates: BTreeMap<Address, ProcessUpdateArg>,
-    ) -> anyhow::Result<HashMap<Vec<u8>, Vec<u8>>> {
+    ) -> anyhow::Result<HashMap<Vec<u8>, BranchData>> {
         let mut branch_node_updates = HashMap::new();
 
         #[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq, Hash)]
@@ -795,10 +879,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             .state
             .load_branch(&hex_to_compact(&self.current_key[..]))?;
 
-        if !self.root_checked
-            && self.current_key.is_empty()
-            && branch_data.as_ref().map(|b| b.is_empty()).unwrap_or(true)
-        {
+        if !self.root_checked && self.current_key.is_empty() && branch_data.is_none() {
             // Special case - empty or deleted root
             self.root_checked = true;
             return Ok(());
@@ -806,8 +887,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
 
         let branch_data = branch_data.unwrap();
         self.branch_before[row] = true;
-        let bitmap = u16::from_be_bytes(*array_ref!(branch_data, 0, 2));
-        let mut pos = 2;
+        let bitmap = branch_data.touch_map;
         if deleted {
             // All cells come as deleted (touched but not present after)
             self.after_map[row] = 0;
@@ -818,6 +898,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         }
         // Loop iterating over the set bits of modMask
         let mut bitset = bitmap;
+        let mut cell_payload_iter = branch_data.payload.iter();
         while bitset != 0 {
             let bit = bitset & 0_u16.overflowing_sub(bitset).0;
             let nibble = bit.trailing_zeros();
@@ -825,16 +906,11 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 row,
                 col: nibble as usize,
             });
-            let field_bits = branch_data[pos];
-            pos += 1;
-            cell.fill_from_fields(&branch_data, pos, field_bits)
-                .with_context(|| {
-                    format!(
-                        "prefix [{}], branchData[{}]",
-                        hex::encode(&self.current_key[..]),
-                        hex::encode(&branch_data)
-                    )
-                })?;
+            cell.fill_from_fields(
+                cell_payload_iter
+                    .next()
+                    .ok_or_else(|| format_err!("empty"))?,
+            );
             trace!(
                 "cell ({}, {:02x}) depth={}, hash=[{:?}], a=[{:?}], s=[{:?}], ex=[{}]",
                 row,
@@ -972,7 +1048,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         !hashed_key[..].starts_with(&self.current_key[..])
     }
 
-    pub(crate) fn fold(&mut self) -> (Option<Vec<u8>>, Vec<u8>) {
+    pub(crate) fn fold(&mut self) -> (Option<BranchData>, Vec<u8>) {
         assert_ne!(self.active_rows, 0, "cannot fold - no active rows");
         trace!(
             "fold: active_rows: {}, current_key: [{:?}], touch_map: {:#018b}, after_map: {:#018b}",
@@ -1038,10 +1114,9 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 up_cell.extension.clear();
                 up_cell.down_hashed_key.clear();
                 if self.branch_before[row] {
-                    let mut bitmap_buf = Vec::with_capacity(2 + 2);
-                    bitmap_buf.extend_from_slice(&self.touch_map[row].to_be_bytes()); // touch_map
-                    bitmap_buf.extend_from_slice(&0_u16.to_be_bytes()); // after_map
-                    branch_data = Some(bitmap_buf);
+                    let branch_data = branch_data.get_or_insert_with(BranchData::default);
+                    branch_data.touch_map = self.touch_map[row];
+                    branch_data.after_map = 0;
                 }
                 self.active_rows -= 1;
                 if up_depth > 0 {
@@ -1077,10 +1152,9 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
 
                 // Delete if it existed
                 if self.branch_before[row] {
-                    let mut bitmap_buf = Vec::with_capacity(2 + 2);
-                    bitmap_buf.extend_from_slice(&self.touch_map[row].to_be_bytes()); // touch_map
-                    bitmap_buf.extend_from_slice(&0_u16.to_be_bytes()); // after_map
-                    branch_data = Some(bitmap_buf);
+                    let branch_data = branch_data.get_or_insert_with(BranchData::default);
+                    branch_data.touch_map = self.touch_map[row];
+                    branch_data.after_map = 0;
                 }
                 self.active_rows -= 1;
 
@@ -1117,9 +1191,12 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                         bitset ^= bit;
                     }
                 }
-                let branch_data = branch_data.get_or_insert_with(Vec::new);
-                branch_data.extend_from_slice(&self.touch_map[row].to_be_bytes());
-                branch_data.extend_from_slice(&self.after_map[row].to_be_bytes());
+                let mut b = BranchData {
+                    touch_map: self.touch_map[row],
+                    after_map: self.after_map[row],
+
+                    ..Default::default()
+                };
 
                 let mut hasher = Keccak256::new();
                 hasher.update(&rlputil::generate_struct_len(total_branch_len));
@@ -1166,28 +1243,24 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                                 field_bits |= HASH_PART;
                             }
 
-                            branch_data.push(field_bits);
-
-                            if !cell.extension.is_empty() && cell.spk.is_some() {
-                                encode_slice(branch_data, &*cell.extension);
-                            }
-                            if let Some(apk) = cell.apk {
-                                encode_slice(branch_data, &apk.0);
-                            }
-                            if let Some((addr, location)) = cell.spk {
-                                let mut spk = [0; H160::len_bytes() + H256::len_bytes()];
-                                spk[..H160::len_bytes()].copy_from_slice(&addr.0);
-                                spk[H160::len_bytes()..].copy_from_slice(&location.0);
-                                encode_slice(branch_data, &spk);
-                            }
-                            if let Some(h) = cell.h {
-                                encode_slice(branch_data, &h.0);
-                            }
+                            b.payload.push(CellPayload {
+                                field_bits,
+                                extension: if !cell.extension.is_empty() && cell.spk.is_some() {
+                                    Some(cell.extension.clone())
+                                } else {
+                                    None
+                                },
+                                apk: cell.apk,
+                                spk: cell.spk,
+                                h: cell.h,
+                            });
                         }
 
                         bitset ^= bit;
                     }
                 }
+
+                branch_data = Some(b);
 
                 {
                     let mut i = last_nibble;
@@ -1226,9 +1299,9 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         }
         if let Some(branch_data) = branch_data.as_mut() {
             trace!(
-                "fold: update key: {}, branch_data: [{}]",
+                "fold: update key: {}, branch_data: [{:?}]",
                 hex::encode(compact_to_hex(&update_key)),
-                hex::encode(&branch_data)
+                branch_data
             );
         }
         (branch_data, update_key)
