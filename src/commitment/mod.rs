@@ -157,6 +157,44 @@ impl Cell {
         self.h = up_cell.h;
     }
 
+    fn fill_from_lower_cell(
+        &mut self,
+        low_cell: Cell,
+        low_depth: usize,
+        pre_extension: &[u8],
+        nibble: usize,
+    ) {
+        if low_cell.apk.is_some() || low_depth < 64 {
+            self.apk = low_cell.apk;
+        }
+        if low_cell.apk.is_some() {
+            self.balance = low_cell.balance;
+            self.nonce = low_cell.nonce;
+            self.code_hash = low_cell.code_hash;
+        }
+        self.spk = low_cell.spk;
+        if low_cell.spk.is_some() {
+            self.storage = low_cell.storage;
+        }
+        if low_cell.h.is_some() {
+            if (low_cell.apk.is_none() && low_depth < 64)
+                || (low_cell.spk.is_none() && low_depth > 64)
+            {
+                // Extension is related to either accounts branch node, or storage branch node, we prepend it by preExtension | nibble
+                self.extension.clear();
+                self.extension.try_extend_from_slice(pre_extension).unwrap();
+                self.extension.push(nibble as u8);
+                self.extension
+                    .try_extend_from_slice(&low_cell.extension)
+                    .unwrap();
+            } else {
+                // Extension is related to a storage branch node, so we copy it upwards as is
+                self.extension = low_cell.extension;
+            }
+        }
+        self.h = low_cell.h;
+    }
+
     // fn account_for_hashing(&self, storage_root_hash: H256) -> ArrayVec<u8, 128> {
     //     let mut buffer = ArrayVec::new();
 
@@ -302,61 +340,6 @@ impl CellGrid {
     #[inline(always)]
     fn grid_cell_mut_ptr(&mut self, cell_position: CellPosition) -> *mut Cell {
         addr_of_mut!(self.grid[cell_position.row as usize][cell_position.col as usize])
-    }
-
-    fn fill_from_upper_cell(
-        &mut self,
-        cell: Option<CellPosition>,
-        up_cell: Option<CellPosition>,
-        depth: usize,
-        depth_increment: usize,
-    ) {
-        let up_cell = self.cell_mut(up_cell).clone();
-        let cell = self.cell_mut(cell);
-
-        cell.fill_from_upper_cell(up_cell, depth, depth_increment)
-    }
-
-    fn fill_from_lower_cell(
-        &mut self,
-        cell: Option<CellPosition>,
-        low_cell: CellPosition,
-        low_depth: usize,
-        pre_extension: &[u8],
-        nibble: usize,
-    ) {
-        let low_cell = self.grid_cell_mut(low_cell).clone();
-        let cell = self.cell_mut(cell);
-
-        if low_cell.apk.is_some() || low_depth < 64 {
-            cell.apk = low_cell.apk;
-        }
-        if low_cell.apk.is_some() {
-            cell.balance = low_cell.balance;
-            cell.nonce = low_cell.nonce;
-            cell.code_hash = low_cell.code_hash;
-        }
-        cell.spk = low_cell.spk;
-        if low_cell.spk.is_some() {
-            cell.storage = low_cell.storage;
-        }
-        if low_cell.h.is_some() {
-            if (low_cell.apk.is_none() && low_depth < 64)
-                || (low_cell.spk.is_none() && low_depth > 64)
-            {
-                // Extension is related to either accounts branch node, or storage branch node, we prepend it by preExtension | nibble
-                cell.extension.clear();
-                cell.extension.try_extend_from_slice(pre_extension).unwrap();
-                cell.extension.push(nibble as u8);
-                cell.extension
-                    .try_extend_from_slice(&low_cell.extension)
-                    .unwrap();
-            } else {
-                // Extension is related to a storage branch node, so we copy it upwards as is
-                cell.extension = low_cell.extension;
-            }
-        }
-        cell.h = low_cell.h;
     }
 }
 
@@ -1095,13 +1078,18 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 }
                 let nibble = self.after_map[row].trailing_zeros().try_into().unwrap();
                 self.grid.cell_mut(up_cell).extension.clear();
-                self.grid.fill_from_lower_cell(
-                    up_cell,
-                    CellPosition { row, col: nibble },
-                    depth,
-                    &self.current_key[up_depth..],
-                    nibble,
-                );
+                {
+                    let low_cell = self
+                        .grid
+                        .grid_cell(CellPosition { row, col: nibble })
+                        .clone();
+                    self.grid.cell_mut(up_cell).fill_from_lower_cell(
+                        low_cell,
+                        depth,
+                        &self.current_key[up_depth..],
+                        nibble,
+                    );
+                }
                 // Delete if it existed
                 if self.branch_before[row] {
                     let mut bitmap_buf = Vec::with_capacity(2 + 2);
