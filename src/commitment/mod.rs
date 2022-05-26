@@ -14,21 +14,6 @@ use std::{
 };
 use tracing::*;
 
-pub trait Trie {
-    type Hash;
-
-    fn process_updates(
-        &mut self,
-        updates: BTreeMap<Address, ProcessUpdateArg>,
-    ) -> HashMap<Vec<u8>, Vec<u8>>;
-
-    /// Produce root hash of the trie
-    fn root_hash(&self) -> anyhow::Result<Self::Hash>;
-
-    /// Drop everything from the trie
-    fn reset(&mut self);
-}
-
 fn uvarint(buf: &[u8]) -> Option<(u64, usize)> {
     let mut x = 0;
     let mut s = 0;
