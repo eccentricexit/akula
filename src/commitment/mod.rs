@@ -3,15 +3,11 @@ pub mod rlputil;
 use self::rlputil::*;
 use crate::{crypto::keccak256, models::*, prefix_length, u256_to_h256, zeroless_view};
 use anyhow::{bail, ensure, format_err};
-use array_macro::array;
 use arrayref::array_ref;
 use arrayvec::ArrayVec;
-use bytes::{BufMut, BytesMut};
+use bytes::BufMut;
 use sha3::{Digest, Keccak256};
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    ptr::addr_of_mut,
-};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tracing::*;
 
 fn uvarint(buf: &[u8]) -> Option<(u64, usize)> {
@@ -179,76 +175,6 @@ impl Cell {
         }
         self.h = low_cell.h;
     }
-
-    // fn account_for_hashing(&self, storage_root_hash: H256) -> ArrayVec<u8, 128> {
-    //     let mut buffer = ArrayVec::new();
-
-    //     let mut balanceBytes = 0;
-    //     if self.balance >= 128 {
-    //         balanceBytes = ((U256::BITS - self.balance.leading_zeros() + 7) / 8) as u8;
-    //     }
-
-    //     let mut nonceBytes = 0;
-    //     if self.nonce < 128 && self.nonce != 0 {
-    //         nonceBytes = 0;
-    //     } else {
-    //         nonceBytes = (((U256::BITS - self.nonce.leading_zeros()) + 7) / 8) as u8;
-    //     }
-
-    //     let mut structLength = balanceBytes + nonceBytes + 2;
-    //     structLength += 66; // Two 32-byte arrays + 2 prefixes
-
-    //     if structLength < 56 {
-    //         buffer.try_push(192 + structLength).unwrap();
-    //     } else {
-    //         let lengthBytes = ((u8::BITS - structLength.leading_zeros() + 7) / 8) as u8;
-    //         buffer.try_push(247 + lengthBytes).unwrap();
-
-    //         let mut i = lengthBytes;
-    //         while i > 0 {
-    //             buffer.try_push(structLength as u8);
-    //             structLength >>= 8;
-    //             i -= 1;
-    //         }
-    //     }
-
-    // // Encoding nonce
-    // if cell.Nonce < 128 && cell.Nonce != 0 {
-    // 	buffer[pos] = byte(cell.Nonce)
-    // } else {
-    // 	buffer[pos] = byte(128 + nonceBytes)
-    // 	var nonce = cell.Nonce
-    // 	for i := nonceBytes; i > 0; i-- {
-    // 		buffer[pos+i] = byte(nonce)
-    // 		nonce >>= 8
-    // 	}
-    // }
-    // pos += 1 + nonceBytes
-
-    // // Encoding balance
-    // if cell.Balance.LtUint64(128) && !cell.Balance.IsZero() {
-    // 	buffer[pos] = byte(cell.Balance.Uint64())
-    // 	pos++
-    // } else {
-    // 	buffer[pos] = byte(128 + balanceBytes)
-    // 	pos++
-    // 	cell.Balance.WriteToSlice(buffer[pos : pos+balanceBytes])
-    // 	pos += balanceBytes
-    // }
-
-    // // Encoding Root and CodeHash
-    // buffer[pos] = 128 + 32
-    // pos++
-    // copy(buffer[pos:], storageRootHash[:])
-    // pos += 32
-    // buffer[pos] = 128 + 32
-    // pos++
-    // copy(buffer[pos:], cell.CodeHash[:])
-    // pos += 32
-    // return pos
-
-    //     buffer
-    // }
 }
 
 #[derive(Debug)]
@@ -256,14 +182,14 @@ struct CellGrid {
     root: Cell, // Root cell of the tree
     // Rows of the grid correspond to the level of depth in the patricia tree
     // Columns of the grid correspond to pointers to the nodes further from the root
-    grid: [[Cell; 16]; 128], // First 64 rows of this grid are for account trie, and next 64 rows are for storage trie
+    grid: Vec<Vec<Cell>>, // First 64 rows of this grid are for account trie, and next 64 rows are for storage trie
 }
 
 impl Default for CellGrid {
     fn default() -> Self {
         Self {
             root: Cell::default(),
-            grid: array![array![Cell::default(); 16]; 128],
+            grid: vec![vec![Cell::default(); 16]; 128],
         }
     }
 }
@@ -285,50 +211,48 @@ impl CellGrid {
         }
     }
 
-    #[inline(always)]
     fn cell(&self, cell_position: Option<CellPosition>) -> &Cell {
         if let Some(position) = cell_position {
             self.grid_cell(position)
         } else {
-            &self.root
+            self.root()
         }
     }
 
-    #[inline(always)]
-    fn grid_cell(&self, cell_position: CellPosition) -> &Cell {
-        &self.grid[cell_position.row as usize][cell_position.col as usize]
-    }
-
-    #[inline(always)]
     fn cell_mut(&mut self, cell_position: Option<CellPosition>) -> &mut Cell {
         if let Some(position) = cell_position {
             self.grid_cell_mut(position)
         } else {
-            &mut self.root
+            self.root_mut()
         }
     }
 
-    #[inline(always)]
+    #[instrument(skip(self))]
+    fn grid_cell(&self, cell_position: CellPosition) -> &Cell {
+        trace!("accessing");
+        &self.grid[cell_position.row as usize][cell_position.col as usize]
+    }
+
+    #[instrument(skip(self))]
     fn grid_cell_mut(&mut self, cell_position: CellPosition) -> &mut Cell {
+        trace!("accessing");
         &mut self.grid[cell_position.row as usize][cell_position.col as usize]
     }
 
-    #[inline(always)]
-    fn cell_mut_ptr(&mut self, cell_position: Option<CellPosition>) -> *mut Cell {
-        if let Some(position) = cell_position {
-            self.grid_cell_mut(position)
-        } else {
-            addr_of_mut!(self.root)
-        }
+    #[instrument(skip(self))]
+    fn root(&self) -> &Cell {
+        trace!("accessing");
+        &self.root
     }
 
-    #[inline(always)]
-    fn grid_cell_mut_ptr(&mut self, cell_position: CellPosition) -> *mut Cell {
-        addr_of_mut!(self.grid[cell_position.row as usize][cell_position.col as usize])
+    #[instrument(skip(self))]
+    fn root_mut(&mut self) -> &mut Cell {
+        trace!("accessing");
+        &mut self.root
     }
 }
 
-fn hash_key(plain_key: &[u8], hashed_key_offset: usize) -> ArrayVec<u8, 65> {
+fn hash_key(plain_key: &[u8], hashed_key_offset: usize) -> ArrayVec<u8, 64> {
     let hash_buf = keccak256(plain_key).0;
     let mut hash_buf = &hash_buf[hashed_key_offset / 2..];
     let mut dest = ArrayVec::new();
@@ -586,7 +510,6 @@ pub struct HexPatriciaHashed<'state, S: State> {
     branch_before: [bool; 128], // For each row, whether there was a branch node in the database loaded in unfold
     touch_map: [u16; 128], // For each row, bitmap of cells that were either present before modification, or modified or deleted
     after_map: [u16; 128], // For each row, bitmap of cells that were present after modification
-    byte_array_writer: BytesMut,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -616,7 +539,6 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             branch_before: [false; 128],
             touch_map: [0; 128],
             after_map: [0; 128],
-            byte_array_writer: Default::default(),
         }
     }
 
@@ -636,7 +558,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             storage: Option<H256>,
         }
 
-        let mut changed_keys = BTreeMap::<(Address, Option<H256>), ArrayVec<u8, 64>>::new();
+        let mut changed_keys = BTreeMap::<(Address, Option<H256>), ArrayVec<u8, 128>>::new();
 
         for (
             address,
@@ -646,7 +568,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             },
         ) in updates
         {
-            let hashed_address = keccak256(address);
+            let hashed_address = hash_key(&address[..], 0);
 
             if account_changed {
                 let mut v = ArrayVec::new();
@@ -655,7 +577,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             }
 
             for location in changed_storage {
-                let hashed_location = keccak256(address);
+                let hashed_location = hash_key(&location[..], 0);
 
                 let mut v = ArrayVec::new();
                 v.try_extend_from_slice(&hashed_address[..]).unwrap();
@@ -756,7 +678,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             cell.down_hashed_key
                 .try_extend_from_slice(&hash_key(&apk.0, depth))
                 .unwrap();
-            cell.down_hashed_key[64 - depth] = 16; // Add terminator
+            cell.down_hashed_key.push(16); // Add terminator
 
             let storage_root = storage_root.unwrap_or_else(|| {
                 if !cell.extension.is_empty() {
@@ -812,11 +734,12 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         buf
     }
 
+    #[instrument(skip_all, fields(root_checked = self.root_checked))]
     fn need_unfolding(&self, hashed_key: &[u8]) -> usize {
         let cell: &Cell;
         let mut depth = 0_usize;
         if self.active_rows == 0 {
-            trace!("need_unfolding root, root_checked = {}", self.root_checked);
+            trace!("root");
             cell = self.grid.cell(None);
             if cell.down_hashed_key.is_empty() && cell.h.is_none() && !self.root_checked {
                 // Need to attempt to unfold the root
@@ -824,10 +747,10 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             }
         } else {
             let col = hashed_key[self.current_key.len()] as usize;
-            cell = self.grid.cell(Some(CellPosition {
+            cell = self.grid.grid_cell(CellPosition {
                 row: self.active_rows - 1,
                 col,
-            }));
+            });
             depth = self.depths[self.active_rows - 1];
             trace!(
                 "needUnfolding cell ({}, {}), currentKey=[{}], depth={}, cell.h=[{:?}]",
@@ -940,10 +863,8 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, hashed_key), fields(hashed_key = &*hex::encode(hashed_key), active_rows=self.active_rows))]
     fn unfold(&mut self, hashed_key: &[u8], unfolding: usize) -> anyhow::Result<()> {
-        trace!("Active rows = {}", self.active_rows);
-
         let touched;
         let present;
         let mut up_depth = 0;
@@ -1048,15 +969,9 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         !hashed_key[..].starts_with(&self.current_key[..])
     }
 
+    #[instrument(skip(self), fields(active_rows=self.active_rows, current_key=&*hex::encode(&self.current_key[..]), touch_map=&*format!("{:#018b}", self.touch_map[self.active_rows - 1]), after_map=&*format!("{:#018b}", self.after_map[self.active_rows - 1])))]
     pub(crate) fn fold(&mut self) -> (Option<BranchData>, Vec<u8>) {
         assert_ne!(self.active_rows, 0, "cannot fold - no active rows");
-        trace!(
-            "fold: active_rows: {}, current_key: [{:?}], touch_map: {:#018b}, after_map: {:#018b}",
-            self.active_rows,
-            hex::encode(&self.current_key[..]),
-            self.touch_map[self.active_rows - 1],
-            self.after_map[self.active_rows - 1]
-        );
         // Move information to the row above
         let row = self.active_rows - 1;
         let mut col = 0;
@@ -1308,7 +1223,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
     }
 
     #[instrument(skip(self))]
-    fn delete_cell(&mut self, hashed_key: ArrayVec<u8, 64>) {
+    fn delete_cell(&mut self, hashed_key: ArrayVec<u8, 128>) {
         trace!("Active rows = {}", self.active_rows);
         let cell: &mut Cell;
         if self.active_rows == 0 {
@@ -1343,8 +1258,8 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         cell.nonce = 0;
     }
 
-    #[instrument(skip(self))]
-    fn update_cell(&mut self, hashed_key: ArrayVec<u8, 64>) -> &mut Cell {
+    #[instrument(skip(self, hashed_key), fields(hashed_key = &*hex::encode(&hashed_key)))]
+    fn update_cell(&mut self, hashed_key: ArrayVec<u8, 128>) -> &mut Cell {
         trace!("Active rows = {}", self.active_rows);
         if self.active_rows == 0 {
             self.active_rows += 1;
@@ -1381,8 +1296,13 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         cell
     }
 
-    #[instrument(skip(self))]
-    fn update_account(&mut self, address: Address, hashed_key: ArrayVec<u8, 64>, account: Account) {
+    #[instrument(skip(self, hashed_key))]
+    fn update_account(
+        &mut self,
+        address: Address,
+        hashed_key: ArrayVec<u8, 128>,
+        account: Account,
+    ) {
         let cell = self.update_cell(hashed_key);
 
         cell.apk = Some(address);
@@ -1396,7 +1316,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         &mut self,
         address: Address,
         location: H256,
-        hashed_key: ArrayVec<u8, 64>,
+        hashed_key: ArrayVec<u8, 128>,
         value: U256,
     ) {
         let cell = self.update_cell(hashed_key);
@@ -1519,13 +1439,20 @@ fn merge_hex_branches(branch_data1: &[u8], branch_data2: &[u8]) -> anyhow::Resul
     Ok(out)
 }
 
+#[instrument(skip(key), fields(key=&*hex::encode(key)))]
 fn hex_to_compact(key: &[u8]) -> Vec<u8> {
     let (zero_byte, key_pos, key_len) = make_compact_zero_byte(key);
+    trace!(
+        "zero_byte={}, key_pos={}, key_len={}",
+        zero_byte,
+        key_pos,
+        key_len
+    );
     let buf_len = key_len / 2 + 1; // always > 0
     let mut buf = vec![0; buf_len];
     buf[0] = zero_byte;
 
-    let key = &key[..key_pos];
+    let key = &key[key_pos..];
     let mut key_len = key.len();
     if has_term(key) {
         key_len -= 1;
@@ -1534,15 +1461,15 @@ fn hex_to_compact(key: &[u8]) -> Vec<u8> {
     let mut key_index = 0;
     let mut buf_index = 1;
     while key_index < key_len {
-        key_index += 2;
-        buf_index += 1;
-
         if key_index == key_len - 1 {
             buf[buf_index] &= 0x0f
         } else {
             buf[buf_index] = key[key_index + 1]
         }
-        buf[buf_index] |= key[key_index] << 4
+        buf[buf_index] |= key[key_index] << 4;
+
+        key_index += 2;
+        buf_index += 1;
     }
 
     buf
@@ -1719,13 +1646,12 @@ fn compact_to_hex(compact: &[u8]) -> Vec<u8> {
 }
 
 fn keybytes_to_hex(s: &[u8]) -> Vec<u8> {
-    let l = s.len() * 2 + 1;
-    let mut nibbles = Vec::with_capacity(l);
-    for (i, b) in s.iter().copied().enumerate() {
-        nibbles[i * 2] = b / 16;
-        nibbles[i * 2 + 1] = b % 16;
+    let mut nibbles = Vec::with_capacity(s.len() * 2 + 1);
+    for b in s.iter().copied() {
+        nibbles.push(b / 16);
+        nibbles.push(b % 16);
     }
-    nibbles[l - 1] = 16;
+    nibbles.push(16);
     nibbles
 }
 
