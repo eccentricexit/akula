@@ -636,6 +636,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         Ok(branch_node_updates)
     }
 
+    #[instrument(skip(self))]
     fn compute_cell_hash(&mut self, pos: Option<CellPosition>, depth: usize) -> ArrayVec<u8, 33> {
         let cell = self.grid.cell_mut(pos);
         let mut storage_root = None;
@@ -666,11 +667,15 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                     hex::encode(&cell.down_hashed_key[..64 - hashed_key_offset + 1]),
                     cell.storage
                 );
-                return leaf_hash_with_key_val(
+                let cell_hash = leaf_hash_with_key_val(
                     &cell.down_hashed_key[..64 - hashed_key_offset + 1],
                     RlpSerializableBytes(&cell.storage.unwrap().to_be_bytes()),
                     false,
                 );
+
+                trace!("computed cell hash {}", hex::encode(&cell_hash));
+
+                return cell_hash;
             }
         }
         if let Some(apk) = cell.apk {
@@ -717,9 +722,9 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         buf.push(0x80 + 32);
         if !cell.extension.is_empty() {
             // Extension
-            let cell_hash = cell.h.expect("compute_cell_hash extension without hash");
+            let cell_hash = cell.h.expect("extension without hash");
             trace!(
-                "extensionHash for [{}]=>[{:?}]",
+                "extension hash for [{}]=>[{:?}]",
                 hex::encode(&cell.extension),
                 cell_hash
             );
@@ -730,6 +735,8 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         } else {
             buf.try_extend_from_slice(&EMPTY_HASH[..]).unwrap();
         }
+
+        trace!("computed cell hash {}", hex::encode(&buf));
 
         buf
     }
@@ -753,7 +760,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             });
             depth = self.depths[self.active_rows - 1];
             trace!(
-                "needUnfolding cell ({}, {}), currentKey=[{}], depth={}, cell.h=[{:?}]",
+                "cell ({}, {}), currentKey=[{}], depth={}, cell.h=[{:?}]",
                 self.active_rows - 1,
                 col,
                 hex::encode(&self.current_key[..]),
@@ -969,7 +976,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         !hashed_key[..].starts_with(&self.current_key[..])
     }
 
-    #[instrument(skip(self), fields(active_rows=self.active_rows, current_key=&*hex::encode(&self.current_key[..]), touch_map=&*format!("{:#018b}", self.touch_map[self.active_rows - 1]), after_map=&*format!("{:#018b}", self.after_map[self.active_rows - 1])))]
+    #[instrument(skip(self), fields(active_rows=self.active_rows, current_key=&*hex::encode(&self.current_key), touch_map=&*format!("{:#018b}", self.touch_map[self.active_rows - 1]), after_map=&*format!("{:#018b}", self.after_map[self.active_rows - 1])))]
     pub(crate) fn fold(&mut self) -> (Option<BranchData>, Vec<u8>) {
         assert_ne!(self.active_rows, 0, "cannot fold - no active rows");
         // Move information to the row above
@@ -1130,14 +1137,6 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                         let cell_pos = CellPosition { row, col: nibble };
                         {
                             let cell_hash = self.compute_cell_hash(Some(cell_pos), depth);
-                            trace!(
-                                "{}: computeCellHash({},{},depth={})=[{:?}]",
-                                nibble,
-                                row,
-                                nibble,
-                                depth,
-                                cell_hash
-                            );
                             hasher.update(cell_hash);
                         }
 
@@ -1214,7 +1213,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         }
         if let Some(branch_data) = branch_data.as_mut() {
             trace!(
-                "fold: update key: {}, branch_data: [{:?}]",
+                "update key: {}, branch_data: [{:?}]",
                 hex::encode(compact_to_hex(&update_key)),
                 branch_data
             );
@@ -1222,9 +1221,9 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         (branch_data, update_key)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), fields(active_rows=self.active_rows))]
     fn delete_cell(&mut self, hashed_key: ArrayVec<u8, 128>) {
-        trace!("Active rows = {}", self.active_rows);
+        trace!("called");
         let cell: &mut Cell;
         if self.active_rows == 0 {
             // Remove the root
@@ -1258,9 +1257,9 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         cell.nonce = 0;
     }
 
-    #[instrument(skip(self, hashed_key), fields(hashed_key = &*hex::encode(&hashed_key)))]
+    #[instrument(skip(self, hashed_key), fields(hashed_key = &*hex::encode(&hashed_key), active_rows=self.active_rows))]
     fn update_cell(&mut self, hashed_key: ArrayVec<u8, 128>) -> &mut Cell {
-        trace!("Active rows = {}", self.active_rows);
+        trace!("called");
         if self.active_rows == 0 {
             self.active_rows += 1;
         }
@@ -1675,19 +1674,25 @@ mod tests {
     }
 
     impl State for MockState {
+        #[instrument(skip(self))]
         fn load_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<BranchData>> {
+            trace!("called");
             Ok(self.branches.get(prefix).cloned())
         }
 
+        #[instrument(skip(self))]
         fn fetch_account(&mut self, address: Address) -> anyhow::Result<Option<Account>> {
+            trace!("called");
             Ok(self.accounts.get(&address).copied())
         }
 
+        #[instrument(skip(self))]
         fn fetch_storage(
             &mut self,
             address: Address,
             location: H256,
         ) -> anyhow::Result<Option<U256>> {
+            trace!("called");
             Ok(self.storage.get(&(address, location)).copied())
         }
     }
