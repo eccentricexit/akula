@@ -1658,7 +1658,8 @@ fn keybytes_to_hex(s: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use hex_literal::hex;
+    use tracing_subscriber::{prelude::*, EnvFilter};
 
     #[derive(Debug, Default)]
     struct AccountUpdate {
@@ -1668,40 +1669,129 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct MockState {
-        /// Backbone of the accounts
-        am: HashMap<Address, Vec<u8>>,
-        /// Backbone of the storage
-        sm: HashMap<(Address, H256), Vec<u8>>,
-        /// Backbone of the commitments
-        cm: HashMap<Vec<u8>, Vec<u8>>,
+        accounts: HashMap<Address, Account>,
+        storage: HashMap<(Address, H256), U256>,
+        branches: HashMap<Vec<u8>, BranchData>,
     }
 
-    /// Collects updates to the state
-    /// and provides them in properly sorted form
-    #[derive(Debug, Default)]
-    struct UpdateBuilder {
-        balances: HashMap<Address, U256>,
-        nonces: HashMap<Address, u64>,
-        code_hashes: HashMap<Address, H256>,
-        storages: HashMap<Address, HashMap<H256, U256>>,
-        deletes: HashSet<Address>,
-        deletes2: HashMap<Address, HashSet<H256>>,
-        keyset: HashSet<Address>,
-        keyset2: HashMap<Address, HashSet<H256>>,
-    }
+    impl State for MockState {
+        fn load_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<BranchData>> {
+            Ok(self.branches.get(prefix).cloned())
+        }
 
-    impl UpdateBuilder {
-        pub fn balance(mut self, addr: Address, balance: impl AsU256) -> Self {
-            self.deletes.remove(&addr);
-            self.balances.insert(addr, balance.as_u256());
-            self.keyset.insert(addr);
+        fn fetch_account(&mut self, address: Address) -> anyhow::Result<Option<Account>> {
+            Ok(self.accounts.get(&address).copied())
+        }
 
-            self
+        fn fetch_storage(
+            &mut self,
+            address: Address,
+            location: H256,
+        ) -> anyhow::Result<Option<U256>> {
+            Ok(self.storage.get(&(address, location)).copied())
         }
     }
 
     #[test]
-    fn empty_state() {
+    fn sepolia_genesis() {
+        let _ = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_target(false))
+            .with(EnvFilter::from_default_env())
+            .try_init();
+
         let mut ms = MockState::default();
+
+        let mut updates = BTreeMap::new();
+        for (address, balance) in [
+            (
+                hex!("a2a6d93439144ffe4d27c9e088dcd8b783946263"),
+                0xd3c21bcecceda1000000_u128,
+            ),
+            (
+                hex!("bc11295936aa79d594139de1b2e12629414f3bdb"),
+                0xd3c21bcecceda1000000_u128,
+            ),
+            (
+                hex!("7cf5b79bfe291a67ab02b393e456ccc4c266f753"),
+                0xd3c21bcecceda1000000_u128,
+            ),
+            (
+                hex!("aaec86394441f915bce3e6ab399977e9906f3b69"),
+                0xd3c21bcecceda1000000_u128,
+            ),
+            (
+                hex!("f47cae1cf79ca6758bfc787dbd21e6bdbe7112b8"),
+                0xd3c21bcecceda1000000_u128,
+            ),
+            (
+                hex!("d7eddb78ed295b3c9629240e8924fb8d8874ddd8"),
+                0xd3c21bcecceda1000000_u128,
+            ),
+            (
+                hex!("8b7f0977bb4f0fbe7076fa22bc24aca043583f5e"),
+                0xd3c21bcecceda1000000_u128,
+            ),
+            (
+                hex!("e2e2659028143784d557bcec6ff3a0721048880a"),
+                0xd3c21bcecceda1000000_u128,
+            ),
+            (
+                hex!("d9a5179f091d85051d3c982785efd1455cec8699"),
+                0xd3c21bcecceda1000000_u128,
+            ),
+            (
+                hex!("beef32ca5b9a198d27b4e02f4c70439fe60356cf"),
+                0xd3c21bcecceda1000000_u128,
+            ),
+            (
+                hex!("0000006916a87b82333f4245046623b23794c65c"),
+                0x84595161401484a000000_u128,
+            ),
+            (
+                hex!("b21c33de1fab3fa15499c62b59fe0cc3250020d1"),
+                0x52b7d2dcc80cd2e4000000_u128,
+            ),
+            (
+                hex!("10f5d45854e038071485ac9e402308cf80d2d2fe"),
+                0x52b7d2dcc80cd2e4000000_u128,
+            ),
+            (
+                hex!("d7d76c58b3a519e9fa6cc4d22dc017259bc49f1e"),
+                0x52b7d2dcc80cd2e4000000_u128,
+            ),
+            (
+                hex!("799d329e5f583419167cd722962485926e338f4a"),
+                0xde0b6b3a7640000_u128,
+            ),
+        ] {
+            ms.accounts.insert(
+                address.into(),
+                Account {
+                    nonce: 0,
+                    balance: balance.as_u256(),
+                    code_hash: EMPTY_HASH,
+                },
+            );
+            updates.insert(
+                address.into(),
+                ProcessUpdateArg {
+                    account_changed: true,
+                    changed_storage: BTreeSet::new(),
+                },
+            );
+        }
+
+        println!("Creating trie...");
+        let mut trie = HexPatriciaHashed::new(&mut ms);
+
+        println!("Processing updates...");
+        trie.process_updates(updates).unwrap();
+
+        assert_eq!(
+            trie.root_hash(),
+            H256(hex!(
+                "5eb6e371a698b8d68f665192350ffcecbbbf322916f4b51bd79bb6887da3f494"
+            ))
+        );
     }
 }
