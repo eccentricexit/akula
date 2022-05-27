@@ -7,7 +7,10 @@ use arrayref::array_ref;
 use arrayvec::ArrayVec;
 use bytes::BufMut;
 use sha3::{Digest, Keccak256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    fmt::Debug,
+};
 use tracing::*;
 
 fn uvarint(buf: &[u8]) -> Option<(u64, usize)> {
@@ -229,25 +232,21 @@ impl CellGrid {
 
     #[instrument(skip(self))]
     fn grid_cell(&self, cell_position: CellPosition) -> &Cell {
-        trace!("accessing");
         &self.grid[cell_position.row as usize][cell_position.col as usize]
     }
 
     #[instrument(skip(self))]
     fn grid_cell_mut(&mut self, cell_position: CellPosition) -> &mut Cell {
-        trace!("accessing");
         &mut self.grid[cell_position.row as usize][cell_position.col as usize]
     }
 
     #[instrument(skip(self))]
     fn root(&self) -> &Cell {
-        trace!("accessing");
         &self.root
     }
 
     #[instrument(skip(self))]
     fn root_mut(&mut self) -> &mut Cell {
-        trace!("accessing");
         &mut self.root
     }
 }
@@ -334,7 +333,7 @@ impl Cell {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CellPayload {
     pub field_bits: PartFlags,
     pub extension: Option<ArrayVec<u8, 64>>,
@@ -343,11 +342,33 @@ pub struct CellPayload {
     pub h: Option<H256>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+impl Debug for CellPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CellPayload")
+            .field("field_bits", &self.field_bits)
+            .field("extension", &self.extension.as_ref().map(hex::encode))
+            .field("apk", &self.apk)
+            .field("spk", &self.spk)
+            .field("h", &self.h)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, PartialEq)]
 pub struct BranchData {
     pub touch_map: u16,
     pub after_map: u16,
     pub payload: Vec<CellPayload>,
+}
+
+impl Debug for BranchData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BranchData")
+            .field("touch_map", &format_args!("{:#018b}", self.touch_map))
+            .field("after_map", &format_args!("{:#018b}", self.after_map))
+            .field("payload", &self.payload)
+            .finish()
+    }
 }
 
 impl BranchData {
@@ -690,7 +711,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                     // Extension
                     let h = cell.h.expect("computeCellHash extension without hash");
                     trace!(
-                        "extension_hash for [{}]=>[{:?}]\n",
+                        "extension_hash for [{}]=>[{:?}]",
                         hex::encode(&cell.extension),
                         h
                     );
@@ -708,11 +729,11 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 code_hash: cell.code_hash,
             });
             trace!(
-                "accountLeafHashWithKey for [{}]=>[{}]\n",
+                "accountLeafHashWithKey for [{}]=>[{}]",
                 hex::encode(&cell.down_hashed_key[..65 - depth]),
                 hex::encode(&account_rlp)
             );
-            account_leaf_hash_with_key(
+            return account_leaf_hash_with_key(
                 &cell.down_hashed_key[..65 - depth],
                 RlpEncodableBytes(&account_rlp),
             );
@@ -760,7 +781,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             });
             depth = self.depths[self.active_rows - 1];
             trace!(
-                "cell ({}, {}), currentKey=[{}], depth={}, cell.h=[{:?}]",
+                "cell ({}, {:x}), currentKey=[{}], depth={}, cell.h=[{:?}]",
                 self.active_rows - 1,
                 col,
                 hex::encode(&self.current_key[..]),
@@ -842,7 +863,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                     .ok_or_else(|| format_err!("empty"))?,
             );
             trace!(
-                "cell ({}, {:02x}) depth={}, hash=[{:?}], a=[{:?}], s=[{:?}], ex=[{}]",
+                "cell ({}, {:x}) depth={}, hash=[{:?}], a=[{:?}], s=[{:?}], ex=[{}]",
                 row,
                 nibble,
                 depth,
@@ -900,7 +921,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             touched = self.touch_map[self.active_rows - 1] & (1_u16 << col as u16) != 0;
             present = self.after_map[self.active_rows - 1] & (1_u16 << col as u16) != 0;
             trace!(
-                "upCell ({}, {:02x}), touched {}, present {}",
+                "upCell ({}, {:x}), touched {}, present {}",
                 self.active_rows - 1,
                 col,
                 touched,
@@ -930,7 +951,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 col: nibble as usize,
             });
             cell.fill_from_upper_cell(up_cell.clone(), depth, unfolding);
-            trace!("cell ({}, {:02x}) depth={}", row, nibble, depth);
+            trace!("cell ({}, {:x}) depth={}", row, nibble, depth);
             if row >= 64 {
                 cell.apk = None;
             }
@@ -954,7 +975,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 col: nibble as usize,
             });
             cell.fill_from_upper_cell(up_cell.clone(), depth, up_cell.down_hashed_key.len());
-            trace!("cell ({}, {:02x}) depth={}", row, nibble, depth);
+            trace!("cell ({}, {:x}) depth={}", row, nibble, depth);
             if row >= 64 {
                 cell.apk = None;
             }
@@ -1131,7 +1152,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                         let nibble = bit.trailing_zeros() as usize;
                         for i in last_nibble..nibble {
                             hasher.update(&[0x80]);
-                            trace!("{}: empty({},{})", i, row, i);
+                            trace!("{:x}: empty({},{:x})", i, row, i);
                         }
                         last_nibble = nibble + 1;
                         let cell_pos = CellPosition { row, col: nibble };
@@ -1180,7 +1201,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                     let mut i = last_nibble;
                     while i < 17 {
                         hasher.update(&[0x80]);
-                        trace!("{:02x}: empty({},{:02x})", i, row, i);
+                        trace!("{:x}: empty({},{:x})", i, row, i);
 
                         i += 1;
                     }
@@ -1246,9 +1267,9 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 // Prevent "spurious deletions", i.e. deletion of absent items
                 self.touch_map[row] |= 1_u16 << col as u16;
                 self.after_map[row] &= !(1_u16 << col as u16);
-                trace!("Setting ({}, {:02x})", row, col);
+                trace!("Setting ({}, {:x})", row, col);
             } else {
-                trace!("Ignoring ({}, {:02x})", row, col);
+                trace!("Ignoring ({}, {:x})", row, col);
             }
         }
         cell.extension.clear();
@@ -1270,7 +1291,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         self.touch_map[row] |= 1_u16 << col as u16;
         self.after_map[row] |= 1_u16 << col as u16;
         trace!(
-            "Setting ({}, {:02x}), touch_map[{}]={:#018b}, depth={}",
+            "Setting ({}, {:x}), touch_map[{}]={:#018b}, depth={}",
             row,
             col,
             row,
@@ -1441,12 +1462,6 @@ fn merge_hex_branches(branch_data1: &[u8], branch_data2: &[u8]) -> anyhow::Resul
 #[instrument(skip(key), fields(key=&*hex::encode(key)))]
 fn hex_to_compact(key: &[u8]) -> Vec<u8> {
     let (zero_byte, key_pos, key_len) = make_compact_zero_byte(key);
-    trace!(
-        "zero_byte={}, key_pos={}, key_len={}",
-        zero_byte,
-        key_pos,
-        key_len
-    );
     let buf_len = key_len / 2 + 1; // always > 0
     let mut buf = vec![0; buf_len];
     buf[0] = zero_byte;
@@ -1676,13 +1691,11 @@ mod tests {
     impl State for MockState {
         #[instrument(skip(self))]
         fn load_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<BranchData>> {
-            trace!("called");
             Ok(self.branches.get(prefix).cloned())
         }
 
         #[instrument(skip(self))]
         fn fetch_account(&mut self, address: Address) -> anyhow::Result<Option<Account>> {
-            trace!("called");
             Ok(self.accounts.get(&address).copied())
         }
 
@@ -1692,111 +1705,131 @@ mod tests {
             address: Address,
             location: H256,
         ) -> anyhow::Result<Option<U256>> {
-            trace!("called");
             Ok(self.storage.get(&(address, location)).copied())
         }
     }
 
-    #[test]
-    fn sepolia_genesis() {
+    fn setup() {
         let _ = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer().with_target(false))
             .with(EnvFilter::from_default_env())
             .try_init();
+    }
+
+    #[test]
+    fn empty() {
+        setup();
 
         let mut ms = MockState::default();
 
-        let mut updates = BTreeMap::new();
-        for (address, balance) in [
-            (
-                hex!("a2a6d93439144ffe4d27c9e088dcd8b783946263"),
-                0xd3c21bcecceda1000000_u128,
-            ),
-            (
-                hex!("bc11295936aa79d594139de1b2e12629414f3bdb"),
-                0xd3c21bcecceda1000000_u128,
-            ),
-            (
-                hex!("7cf5b79bfe291a67ab02b393e456ccc4c266f753"),
-                0xd3c21bcecceda1000000_u128,
-            ),
-            (
-                hex!("aaec86394441f915bce3e6ab399977e9906f3b69"),
-                0xd3c21bcecceda1000000_u128,
-            ),
-            (
-                hex!("f47cae1cf79ca6758bfc787dbd21e6bdbe7112b8"),
-                0xd3c21bcecceda1000000_u128,
-            ),
-            (
-                hex!("d7eddb78ed295b3c9629240e8924fb8d8874ddd8"),
-                0xd3c21bcecceda1000000_u128,
-            ),
-            (
-                hex!("8b7f0977bb4f0fbe7076fa22bc24aca043583f5e"),
-                0xd3c21bcecceda1000000_u128,
-            ),
-            (
-                hex!("e2e2659028143784d557bcec6ff3a0721048880a"),
-                0xd3c21bcecceda1000000_u128,
-            ),
-            (
-                hex!("d9a5179f091d85051d3c982785efd1455cec8699"),
-                0xd3c21bcecceda1000000_u128,
-            ),
-            (
-                hex!("beef32ca5b9a198d27b4e02f4c70439fe60356cf"),
-                0xd3c21bcecceda1000000_u128,
-            ),
-            (
-                hex!("0000006916a87b82333f4245046623b23794c65c"),
-                0x84595161401484a000000_u128,
-            ),
-            (
-                hex!("b21c33de1fab3fa15499c62b59fe0cc3250020d1"),
-                0x52b7d2dcc80cd2e4000000_u128,
-            ),
-            (
-                hex!("10f5d45854e038071485ac9e402308cf80d2d2fe"),
-                0x52b7d2dcc80cd2e4000000_u128,
-            ),
-            (
-                hex!("d7d76c58b3a519e9fa6cc4d22dc017259bc49f1e"),
-                0x52b7d2dcc80cd2e4000000_u128,
-            ),
-            (
-                hex!("799d329e5f583419167cd722962485926e338f4a"),
-                0xde0b6b3a7640000_u128,
-            ),
-        ] {
-            ms.accounts.insert(
-                address.into(),
-                Account {
-                    nonce: 0,
-                    balance: balance.as_u256(),
-                    code_hash: EMPTY_HASH,
-                },
-            );
-            updates.insert(
-                address.into(),
-                ProcessUpdateArg {
-                    account_changed: true,
-                    changed_storage: BTreeSet::new(),
-                },
-            );
-        }
+        let mut trie = HexPatriciaHashed::new(&mut ms);
+        assert_eq!(
+            trie.process_updates(BTreeMap::new()).unwrap(),
+            HashMap::new()
+        );
 
-        println!("Creating trie...");
+        assert_eq!(trie.root_hash(), EMPTY_HASH);
+    }
+
+    #[test]
+    fn sepolia_genesis() {
+        setup();
+
+        let mut ms = MockState::default();
         let mut trie = HexPatriciaHashed::new(&mut ms);
 
-        println!("Processing updates...");
-        trie.process_updates(updates).unwrap();
+        for (state_root, balances) in [
+            (
+                hex!("5eb6e371a698b8d68f665192350ffcecbbbf322916f4b51bd79bb6887da3f494"),
+                vec![
+                    (
+                        hex!("a2a6d93439144ffe4d27c9e088dcd8b783946263"),
+                        0xd3c21bcecceda1000000_u128,
+                    ),
+                    (
+                        hex!("bc11295936aa79d594139de1b2e12629414f3bdb"),
+                        0xd3c21bcecceda1000000_u128,
+                    ),
+                    (
+                        hex!("7cf5b79bfe291a67ab02b393e456ccc4c266f753"),
+                        0xd3c21bcecceda1000000_u128,
+                    ),
+                    (
+                        hex!("aaec86394441f915bce3e6ab399977e9906f3b69"),
+                        0xd3c21bcecceda1000000_u128,
+                    ),
+                    (
+                        hex!("f47cae1cf79ca6758bfc787dbd21e6bdbe7112b8"),
+                        0xd3c21bcecceda1000000_u128,
+                    ),
+                    (
+                        hex!("d7eddb78ed295b3c9629240e8924fb8d8874ddd8"),
+                        0xd3c21bcecceda1000000_u128,
+                    ),
+                    (
+                        hex!("8b7f0977bb4f0fbe7076fa22bc24aca043583f5e"),
+                        0xd3c21bcecceda1000000_u128,
+                    ),
+                    (
+                        hex!("e2e2659028143784d557bcec6ff3a0721048880a"),
+                        0xd3c21bcecceda1000000_u128,
+                    ),
+                    (
+                        hex!("d9a5179f091d85051d3c982785efd1455cec8699"),
+                        0xd3c21bcecceda1000000_u128,
+                    ),
+                    (
+                        hex!("beef32ca5b9a198d27b4e02f4c70439fe60356cf"),
+                        0xd3c21bcecceda1000000_u128,
+                    ),
+                    (
+                        hex!("0000006916a87b82333f4245046623b23794c65c"),
+                        0x84595161401484a000000_u128,
+                    ),
+                    (
+                        hex!("b21c33de1fab3fa15499c62b59fe0cc3250020d1"),
+                        0x52b7d2dcc80cd2e4000000_u128,
+                    ),
+                    (
+                        hex!("10f5d45854e038071485ac9e402308cf80d2d2fe"),
+                        0x52b7d2dcc80cd2e4000000_u128,
+                    ),
+                    (
+                        hex!("d7d76c58b3a519e9fa6cc4d22dc017259bc49f1e"),
+                        0x52b7d2dcc80cd2e4000000_u128,
+                    ),
+                    (
+                        hex!("799d329e5f583419167cd722962485926e338f4a"),
+                        0xde0b6b3a7640000_u128,
+                    ),
+                ],
+            ),
+            (
+                hex!("091d4ecd59dce3067d340b3aadfc0542974b4fb4db98af39f980a91ea00db9dc"),
+                vec![(hex!("2f14582947e292a2ecd20c430b46f2d27cfe213c"), 2 * ETHER)],
+            ),
+        ] {
+            let mut updates = BTreeMap::new();
+            for (address, balance) in balances {
+                trie.state
+                    .accounts
+                    .entry(address.into())
+                    .or_default()
+                    .balance += balance.as_u256();
 
-        assert_eq!(
-            trie.root_hash(),
-            H256(hex!(
-                "5eb6e371a698b8d68f665192350ffcecbbbf322916f4b51bd79bb6887da3f494"
-            ))
-        );
+                updates.insert(
+                    address.into(),
+                    ProcessUpdateArg {
+                        account_changed: true,
+                        changed_storage: BTreeSet::new(),
+                    },
+                );
+            }
+            for (k, branch) in trie.process_updates(updates).unwrap() {
+                trie.state.branches.insert(k, branch);
+            }
+
+            assert_eq!(trie.root_hash(), H256(state_root));
+        }
     }
 }
