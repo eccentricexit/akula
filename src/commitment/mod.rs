@@ -2,7 +2,7 @@ pub mod rlputil;
 
 use self::rlputil::*;
 use crate::{crypto::keccak256, models::*, prefix_length, u256_to_h256, zeroless_view};
-use anyhow::{bail, ensure, format_err};
+use anyhow::{bail, ensure, format_err, Context};
 use arrayref::array_ref;
 use arrayvec::ArrayVec;
 use bytes::BufMut;
@@ -579,7 +579,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             storage: Option<H256>,
         }
 
-        let mut changed_keys = BTreeMap::<(Address, Option<H256>), ArrayVec<u8, 128>>::new();
+        let mut changed_keys = BTreeMap::new();
 
         for (
             address,
@@ -594,7 +594,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             if account_changed {
                 let mut v = ArrayVec::new();
                 v.try_extend_from_slice(&hashed_address[..]).unwrap();
-                changed_keys.insert((address, None), v);
+                changed_keys.insert(v, (address, None));
             }
 
             for location in changed_storage {
@@ -603,11 +603,11 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 let mut v = ArrayVec::new();
                 v.try_extend_from_slice(&hashed_address[..]).unwrap();
                 v.try_extend_from_slice(&hashed_location[..]).unwrap();
-                changed_keys.insert((address, Some(location)), v);
+                changed_keys.insert(v, (address, Some(location)));
             }
         }
 
-        for ((address, storage), hashed_key) in changed_keys {
+        for (hashed_key, (address, storage)) in changed_keys {
             trace!(
                 "address={:?} storage={:?} hashed_key={:?}, current_key={:?}",
                 address,
@@ -1374,89 +1374,41 @@ fn has_term(s: &[u8]) -> bool {
     s.last().map(|&v| v == 16).unwrap_or(false)
 }
 
-/// Combines two branchData, number 2 coming after (and potentially shadowing) number 1
-fn merge_hex_branches(branch_data1: &[u8], branch_data2: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut out = vec![];
+/// Combines two `BranchData`, number 2 coming after (and potentially shadowing) number 1
+fn merge_hex_branches(old: &BranchData, new: &BranchData) -> anyhow::Result<BranchData> {
+    let mut merged = BranchData::default();
 
-    let touch_map1 = u16::from_be_bytes(*array_ref!(branch_data1, 0, 2));
-    let after_map1 = u16::from_be_bytes(*array_ref!(branch_data1, 2, 2));
-    let bitmap1 = touch_map1 & after_map1;
-    let mut pos1 = 4;
-    let touch_map2 = u16::from_be_bytes(*array_ref!(branch_data2, 0, 2));
-    let after_map2 = u16::from_be_bytes(*array_ref!(branch_data2, 2, 2));
-    let bitmap2 = touch_map2 & after_map2;
-    let mut pos2 = 4;
+    let old_bitmap = old.touch_map & old.after_map;
+    let new_bitmap = new.touch_map & new.after_map;
 
-    out.extend_from_slice(&(touch_map1 | touch_map2).to_be_bytes());
-    out.extend_from_slice(&after_map2.to_be_bytes());
+    merged.touch_map = old.touch_map | new.touch_map;
+    merged.after_map = new.after_map;
 
     {
-        let mut bitset = bitmap1 | bitmap2;
+        let mut bitset = old_bitmap | new_bitmap;
+        let mut old_payload_iter = old.payload.iter();
+        let mut new_payload_iter = new.payload.iter();
         while bitset != 0 {
             let bit = bitset & 0_u16.overflowing_sub(bitset).0;
-            if bitmap2 & bit != 0 {
-                // Add fields from branchData2
-                let field_bits = branch_data2[pos2];
-                out.push(field_bits);
-                pos2 += 1;
-                let mut i = 0;
-                while i < field_bits.count_ones() {
-                    let (l, n) = uvarint(&branch_data2[pos2..])
-                        .ok_or_else(|| format_err!("MergeHexBranches value2 overflow for field"))?;
-                    if n == 0 {
-                        bail!("MergeHexBranches buffer2 too small for field");
-                    }
-                    out.extend_from_slice(&branch_data2[pos2..pos2 + n]);
-                    pos2 += n;
-
-                    let l = l as usize;
-                    if branch_data2.len() < pos2 + l {
-                        bail!("MergeHexBranches buffer2 too small for field");
-                    }
-                    if l > 0 {
-                        out.extend_from_slice(&branch_data2[pos2..pos2 + l]);
-                        pos2 += l;
-                    }
-                    i += 1;
-                }
+            if new_bitmap & bit != 0 {
+                // Add fields from new BranchData
+                merged
+                    .payload
+                    .push(new_payload_iter.next().context("no payload2")?.clone());
             }
-            if bitmap1 & bit != 0 {
-                let add = (touch_map2 & bit == 0) && (after_map2 & bit != 0); // Add fields from branchData1
-                let field_bits = branch_data1[pos1];
-                if add {
-                    out.push(field_bits);
-                }
-                pos1 += 1;
-                let mut i = 0;
-                while i < field_bits.count_ones() {
-                    let (l, n) = uvarint(&branch_data1[pos1..])
-                        .ok_or_else(|| format_err!("value1 overflow for field"))?;
-                    if n == 0 {
-                        bail!("MergeHexBranches buffer1 too small for field");
-                    }
-                    if add {
-                        out.extend_from_slice(&branch_data1[pos1..pos1 + n]);
-                    }
-                    pos1 += n;
-
-                    let l = l as usize;
-                    if branch_data1.len() < pos1 + l {
-                        bail!("MergeHexBranches buffer1 too small for field");
-                    }
-                    if l > 0 {
-                        if add {
-                            out.extend_from_slice(&branch_data1[pos1..pos1 + l]);
-                        }
-                        pos1 += l;
-                    }
-                    i += 1;
+            if old_bitmap & bit != 0 {
+                // Add fields from old BranchData
+                if (new.touch_map & bit == 0) && (new.after_map & bit != 0) {
+                    merged
+                        .payload
+                        .push(old_payload_iter.next().context("no payload1")?.clone());
                 }
             }
             bitset ^= bit;
         }
     }
 
-    Ok(out)
+    Ok(merged)
 }
 
 #[instrument(skip(key), fields(key=&*hex::encode(key)))]
@@ -1673,6 +1625,7 @@ fn keybytes_to_hex(s: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use hex_literal::hex;
+    use std::collections::hash_map::Entry;
     use tracing_subscriber::{prelude::*, EnvFilter};
 
     #[derive(Debug, Default)]
@@ -1826,7 +1779,14 @@ mod tests {
                 );
             }
             for (k, branch) in trie.process_updates(updates).unwrap() {
-                trie.state.branches.insert(k, branch);
+                match trie.state.branches.entry(k) {
+                    Entry::Occupied(mut pre) => {
+                        pre.insert(merge_hex_branches(pre.get(), &branch).unwrap());
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(branch);
+                    }
+                }
             }
 
             assert_eq!(trie.root_hash(), H256(state_root));
