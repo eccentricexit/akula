@@ -1685,6 +1685,146 @@ mod tests {
     }
 
     #[test]
+    fn branchdata_encoding() {
+        for (buf, branch_data) in [
+            (
+                &hex!("818081800434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000070434c783e610b30e83ecff161effbb7cd591dfccb722000000000000000000000000000000000000000000000000000000000000000e0434c783e610b30e83ecff161effbb7cd591dfccb7220000000000000000000000000000000000000000000000000000000000000004") as &[u8],
+                BranchData {
+                    // 7, 8, f
+                    touch_map: 0b1000000110000000,
+                    after_map: 0b1000000110000000,
+                    payload: vec![
+                        CellPayload {
+                            field_bits: STORAGE_PLAIN_PART,
+                            extension: None,
+                            apk: None,
+                            spk: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("0000000000000000000000000000000000000000000000000000000000000007")))),
+                            h: None,
+                        },
+                        CellPayload {
+                            field_bits: STORAGE_PLAIN_PART,
+                            extension: None,
+                            apk: None,
+                            spk: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("000000000000000000000000000000000000000000000000000000000000000e")))),
+                            h: None,
+                        },
+                        CellPayload {
+                            field_bits: STORAGE_PLAIN_PART,
+                            extension: None,
+                            apk: None,
+                            spk: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("0000000000000000000000000000000000000000000000000000000000000004")))),
+                            h: None,
+                        },
+                    ],
+                },
+            ),
+            (
+                &hex!("2f7f2f7f0434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000050901092084b6ffa0dc93412dbc5675a4856167d494f018749d04036ca7cbdd2b4c21141c0434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000060434c783e610b30e83ecff161effbb7cd591dfccb722000000000000000000000000000000000000000000000000000000000001000208209f4533f1b8b641fe63d28fd5c827deca05427b086575535adf8536b7c19571d40434c783e610b30e83ecff161effbb7cd591dfccb7220000000000000000000000000000000000000000000000000000000000010004082078e36b30cc9dace946d7e93f6f9fd2e1b1ca7aee38b5b483417f0fa95f05e6dc0434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000100050820e8a4584ec3838e5f013e695e14c7443acacd635a6bc90dd5165947dd712d9a6c0820c00d8050a3e3af1ec71d35ef3cc72ee99127680c96db1f439c7b04e9ea6badb90820356e9beaa88ef7b6fce769d2a711dae16df4b2916a66a2182d50be8e590fda3e0820151eba0a12fd97cbc70045e701fbe6b2c6d13141c147ae4f11f0e9259d816a45") as &[u8],
+                BranchData {
+                    touch_map: 0b0010111101111111,
+                    after_map: 0b0010111101111111,
+                    payload: vec![
+                        CellPayload {
+                            field_bits: STORAGE_PLAIN_PART,
+                            extension: None,
+                            apk: None,
+                            spk: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000000005").into())),
+                            h: None,
+                        },
+                        CellPayload {
+                            field_bits: HASHEDKEY_PART | HASH_PART,
+                            extension: Some({
+                                let mut out = ArrayVec::new();
+                                out.push(0x09);
+                                out
+                            }),
+                            apk: None,
+                            spk: None,
+                            h: Some(hex!("84b6ffa0dc93412dbc5675a4856167d494f018749d04036ca7cbdd2b4c21141c").into()),
+                        },
+                        CellPayload {
+                            field_bits: STORAGE_PLAIN_PART,
+                            extension: None,
+                            apk: None,
+                            spk: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000000006").into())),
+                            h: None,
+                        },
+                        CellPayload {
+                            field_bits: STORAGE_PLAIN_PART,
+                            extension: None,
+                            apk: None,
+                            spk: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000010002").into())),
+                            h: None,
+                        },
+                        CellPayload {
+                            field_bits: HASH_PART,
+                            extension: None,
+                            apk: None,
+                            spk: None,
+                            h: Some(hex!("9f4533f1b8b641fe63d28fd5c827deca05427b086575535adf8536b7c19571d4").into()),
+                        },
+                        CellPayload {
+                            field_bits: STORAGE_PLAIN_PART,
+                            extension: None,
+                            apk: None,
+                            spk: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000010004").into())),
+                            h: None,
+                        },
+                        CellPayload {
+                            field_bits: HASH_PART,
+                            extension: None,
+                            apk: None,
+                            spk: None,
+                            h: Some(hex!("78e36b30cc9dace946d7e93f6f9fd2e1b1ca7aee38b5b483417f0fa95f05e6dc").into()),
+                        },
+                        CellPayload {
+                            field_bits: STORAGE_PLAIN_PART,
+                            extension: None,
+                            apk: None,
+                            spk: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000010005").into())),
+                            h: None,
+                        },
+                        CellPayload {
+                            field_bits: HASH_PART,
+                            extension: None,
+                            apk: None,
+                            spk: None,
+                            h: Some(hex!("e8a4584ec3838e5f013e695e14c7443acacd635a6bc90dd5165947dd712d9a6c").into()),
+                        },
+                        CellPayload {
+                            field_bits: HASH_PART,
+                            extension: None,
+                            apk: None,
+                            spk: None,
+                            h: Some(hex!("c00d8050a3e3af1ec71d35ef3cc72ee99127680c96db1f439c7b04e9ea6badb9").into()),
+                        },
+                        CellPayload {
+                            field_bits: HASH_PART,
+                            extension: None,
+                            apk: None,
+                            spk: None,
+                            h: Some(hex!("356e9beaa88ef7b6fce769d2a711dae16df4b2916a66a2182d50be8e590fda3e").into()),
+                        },
+                        CellPayload {
+                            field_bits: HASH_PART,
+                            extension: None,
+                            apk: None,
+                            spk: None,
+                            h: Some(hex!("151eba0a12fd97cbc70045e701fbe6b2c6d13141c147ae4f11f0e9259d816a45").into()),
+                        },
+                    ]
+                }
+            )
+        ] {
+            let (decoded, pos) = BranchData::decode(buf, 0).unwrap();
+            assert_eq!(pos, buf.len());
+            assert_eq!(decoded, branch_data);
+
+            assert_eq!(decoded.encode(), buf);
+        }
+    }
+
+    #[test]
     fn sepolia_genesis() {
         setup();
 
