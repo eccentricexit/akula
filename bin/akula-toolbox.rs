@@ -153,6 +153,7 @@ async fn download_headers(
             consensus,
             max_block: u64::MAX.into(),
             graph: Graph::new(),
+            increment: None,
         },
         false,
     );
