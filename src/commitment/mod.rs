@@ -8,7 +8,7 @@ use arrayvec::ArrayVec;
 use bytes::BufMut;
 use sha3::{Digest, Keccak256};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::{Debug, Display},
 };
 use tracing::*;
@@ -594,7 +594,7 @@ struct CellPosition {
 #[derive(Clone, Debug, Default)]
 pub struct ProcessUpdateArg {
     pub account_changed: bool,
-    pub changed_storage: BTreeSet<H256>,
+    pub changed_storage: HashSet<H256>,
 }
 
 impl<'state, S: State> HexPatriciaHashed<'state, S> {
@@ -719,17 +719,18 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             cell.down_hashed_key
                 .try_extend_from_slice(&hash_key(&location[..], hashed_key_offset))
                 .unwrap();
-            cell.down_hashed_key[64 - hashed_key_offset] = 16; // Add terminator
+            cell.down_hashed_key.push(16); // Add terminator
             if singleton {
                 trace!(
                     "leafHashWithKeyVal(singleton) for [{}]=>[{:?}]",
                     hex::encode(&cell.down_hashed_key[..64 - hashed_key_offset + 1]),
                     cell.storage
                 );
+                let storage_bytes = cell.storage.unwrap().to_be_bytes();
                 storage_root = Some(H256::from_slice(
                     &leaf_hash_with_key_val(
                         &cell.down_hashed_key[..64 - hashed_key_offset + 1],
-                        RlpSerializableBytes(&cell.storage.unwrap().to_be_bytes()),
+                        RlpSerializableBytes(zeroless_view(&storage_bytes)),
                         true,
                     )[1..],
                 ));
@@ -739,15 +740,12 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                     hex::encode(&cell.down_hashed_key[..64 - hashed_key_offset + 1]),
                     cell.storage
                 );
-                let cell_hash = leaf_hash_with_key_val(
+                let storage_bytes = cell.storage.unwrap().to_be_bytes();
+                return leaf_hash_with_key_val(
                     &cell.down_hashed_key[..64 - hashed_key_offset + 1],
-                    RlpSerializableBytes(&cell.storage.unwrap().to_be_bytes()),
+                    RlpSerializableBytes(zeroless_view(&storage_bytes)),
                     false,
                 );
-
-                trace!("computed cell hash {}", hex::encode(&cell_hash));
-
-                return cell_hash;
             }
         }
         if let Some(apk) = cell.apk {
@@ -852,7 +850,10 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 return 1;
             }
         }
-        let cpl = prefix_length(&hashed_key[depth..], &cell.down_hashed_key[..]);
+        let cpl = prefix_length(
+            &hashed_key[depth..],
+            &cell.down_hashed_key[..cell.down_hashed_key.len() - 1],
+        );
         trace!(
             "cpl={}, cell.downHashedKey=[{}], depth={}, hashedKey[depth..]=[{}]",
             cpl,
@@ -1636,7 +1637,7 @@ fn leaf_hash_with_key_val(
 ) -> ArrayVec<u8, 33> {
     // Compute the total length of binary representation
     // Write key
-    let compact_len = key.len() / 2 + 1;
+    let compact_len = (key.len() - 1) / 2 + 1;
     let (compact0, ni) = if key.len() & 1 == 0 {
         (0x30 + key[0], 1) // Odd: (3<<4) + first nibble
     } else {
@@ -1657,7 +1658,7 @@ fn compact_to_hex(compact: &[u8]) -> Vec<u8> {
     let mut base = keybytes_to_hex(compact);
     // delete terminator flag
     if base[0] < 2 {
-        base.truncate(base.len() - 1);
+        base.pop();
     }
     // apply odd flag
     let chop = (2 - base[0] as usize) & 1;
@@ -1969,7 +1970,7 @@ mod tests {
                     address.into(),
                     ProcessUpdateArg {
                         account_changed: true,
-                        changed_storage: BTreeSet::new(),
+                        changed_storage: HashSet::new(),
                     },
                 );
             }
