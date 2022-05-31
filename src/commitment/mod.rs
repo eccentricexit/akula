@@ -615,14 +615,10 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         }
     }
 
-    pub fn root_hash(&mut self) -> H256 {
-        H256::from_slice(&self.compute_cell_hash(None, 0)[1..])
-    }
-
     pub fn process_updates(
-        &mut self,
+        mut self,
         updates: BTreeMap<Address, ProcessUpdateArg>,
-    ) -> anyhow::Result<HashMap<Vec<u8>, BranchData>> {
+    ) -> anyhow::Result<(H256, HashMap<Vec<u8>, BranchData>)> {
         let mut branch_node_updates = HashMap::new();
 
         #[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq, Hash)]
@@ -706,7 +702,10 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             }
         }
 
-        Ok(branch_node_updates)
+        Ok((
+            H256::from_slice(&self.compute_cell_hash(None, 0)[1..]),
+            branch_node_updates,
+        ))
     }
 
     #[instrument(skip(self))]
@@ -1727,15 +1726,14 @@ mod tests {
     fn empty() {
         setup();
 
-        let mut ms = MockState::default();
+        let mut state = MockState::default();
 
-        let mut trie = HexPatriciaHashed::new(&mut ms);
         assert_eq!(
-            trie.process_updates(BTreeMap::new()).unwrap(),
-            HashMap::new()
+            HexPatriciaHashed::new(&mut state)
+                .process_updates(BTreeMap::new())
+                .unwrap(),
+            (EMPTY_HASH, HashMap::new())
         );
-
-        assert_eq!(trie.root_hash(), EMPTY_HASH);
     }
 
     #[test]
@@ -1890,10 +1888,9 @@ mod tests {
     fn sepolia_genesis() {
         setup();
 
-        let mut ms = MockState::default();
-        let mut trie = HexPatriciaHashed::new(&mut ms);
+        let mut state = MockState::default();
 
-        for (state_root, balances) in [
+        for (expected_state_root, balances) in [
             (
                 hex!("5eb6e371a698b8d68f665192350ffcecbbbf322916f4b51bd79bb6887da3f494"),
                 vec![
@@ -1960,17 +1957,13 @@ mod tests {
                 ],
             ),
             (
-                hex!("091d4ecd59dce3067d340b3aadfc0542974b4fb4db98af39f980a91ea00db9dc"),
+                hex!("c91d4ecd59dce3067d340b3aadfc0542974b4fb4db98af39f980a91ea00db9dc"),
                 vec![(hex!("2f14582947e292a2ecd20c430b46f2d27cfe213c"), 2 * ETHER)],
             ),
         ] {
             let mut updates = BTreeMap::new();
             for (address, balance) in balances {
-                trie.state
-                    .accounts
-                    .entry(address.into())
-                    .or_default()
-                    .balance += balance.as_u256();
+                state.accounts.entry(address.into()).or_default().balance += balance.as_u256();
 
                 updates.insert(
                     address.into(),
@@ -1980,8 +1973,11 @@ mod tests {
                     },
                 );
             }
-            for (k, branch) in trie.process_updates(updates).unwrap() {
-                match trie.state.branches.entry(k) {
+            let (state_root, updates) = HexPatriciaHashed::new(&mut state)
+                .process_updates(updates)
+                .unwrap();
+            for (k, branch) in updates {
+                match state.branches.entry(k) {
                     Entry::Occupied(mut pre) => {
                         pre.insert(merge_hex_branches(pre.get(), &branch).unwrap());
                     }
@@ -1991,7 +1987,7 @@ mod tests {
                 }
             }
 
-            assert_eq!(trie.root_hash(), H256(state_root));
+            assert_eq!(state_root, H256(expected_state_root));
         }
     }
 }
