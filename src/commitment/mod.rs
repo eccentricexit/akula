@@ -494,9 +494,9 @@ impl BranchData {
 }
 
 pub trait State {
-    fn load_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<BranchData>>;
-    fn fetch_account(&mut self, address: Address) -> anyhow::Result<Option<Account>>;
-    fn fetch_storage(&mut self, address: Address, location: H256) -> anyhow::Result<Option<U256>>;
+    fn get_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<BranchData>>;
+    fn get_account(&mut self, address: Address) -> anyhow::Result<Option<Account>>;
+    fn get_storage(&mut self, address: Address, location: H256) -> anyhow::Result<Option<U256>>;
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -591,7 +591,7 @@ struct CellPosition {
     col: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ProcessUpdateArg {
     pub account_changed: bool,
     pub changed_storage: BTreeSet<H256>,
@@ -617,7 +617,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
 
     pub fn process_updates(
         mut self,
-        updates: BTreeMap<Address, ProcessUpdateArg>,
+        updates: HashMap<Address, ProcessUpdateArg>,
     ) -> anyhow::Result<(H256, HashMap<Vec<u8>, BranchData>)> {
         let mut branch_node_updates = HashMap::new();
 
@@ -683,12 +683,12 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
 
             // Update the cell
             if let Some(location) = storage {
-                if let Some(value) = self.state.fetch_storage(address, location)? {
+                if let Some(value) = self.state.get_storage(address, location)? {
                     self.update_storage(address, location, hashed_key, value);
                 } else {
                     self.delete_cell(hashed_key);
                 }
-            } else if let Some(account) = self.state.fetch_account(address)? {
+            } else if let Some(account) = self.state.get_account(address)? {
                 self.update_account(address, hashed_key, account);
             } else {
                 self.delete_cell(hashed_key);
@@ -879,7 +879,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
     ) -> anyhow::Result<()> {
         let branch_data = self
             .state
-            .load_branch(&hex_to_compact(&self.current_key[..]))?;
+            .get_branch(&hex_to_compact(&self.current_key[..]))?;
 
         if !self.root_checked && self.current_key.is_empty() && branch_data.is_none() {
             // Special case - empty or deleted root
@@ -924,7 +924,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 hex::encode(&cell.extension)
             );
             if let Some(account) = cell.apk {
-                cell.fill_from_account(self.state.fetch_account(account)?.as_ref());
+                cell.fill_from_account(self.state.get_account(account)?.as_ref());
                 trace!(
                     "accountFn[{:?}] return balance={}, nonce={}",
                     account,
@@ -933,7 +933,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 );
             }
             if let Some((account, location)) = cell.spk {
-                cell.fill_from_storage(self.state.fetch_storage(account, location)?);
+                cell.fill_from_storage(self.state.get_storage(account, location)?);
             }
             cell.derive_hashed_keys(depth)?;
         }
@@ -1696,17 +1696,17 @@ mod tests {
 
     impl State for MockState {
         #[instrument(skip(self))]
-        fn load_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<BranchData>> {
+        fn get_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<BranchData>> {
             Ok(self.branches.get(prefix).cloned())
         }
 
         #[instrument(skip(self))]
-        fn fetch_account(&mut self, address: Address) -> anyhow::Result<Option<Account>> {
+        fn get_account(&mut self, address: Address) -> anyhow::Result<Option<Account>> {
             Ok(self.accounts.get(&address).copied())
         }
 
         #[instrument(skip(self))]
-        fn fetch_storage(
+        fn get_storage(
             &mut self,
             address: Address,
             location: H256,
@@ -1730,7 +1730,7 @@ mod tests {
 
         assert_eq!(
             HexPatriciaHashed::new(&mut state)
-                .process_updates(BTreeMap::new())
+                .process_updates(HashMap::new())
                 .unwrap(),
             (EMPTY_HASH, HashMap::new())
         );
@@ -1961,7 +1961,7 @@ mod tests {
                 vec![(hex!("2f14582947e292a2ecd20c430b46f2d27cfe213c"), 2 * ETHER)],
             ),
         ] {
-            let mut updates = BTreeMap::new();
+            let mut updates = HashMap::new();
             for (address, balance) in balances {
                 state.accounts.entry(address.into()).or_default().balance += balance.as_u256();
 
