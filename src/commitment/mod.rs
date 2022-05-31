@@ -9,7 +9,7 @@ use bytes::BufMut;
 use sha3::{Digest, Keccak256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    fmt::Debug,
+    fmt::{Debug, Display},
 };
 use tracing::*;
 
@@ -315,16 +315,14 @@ impl Cell {
         Ok(())
     }
 
-    fn fill_from_fields(&mut self, data: &CellPayload) {
+    fn fill_from_fields(&mut self, data: CellPayload) {
         self.down_hashed_key.clear();
         self.extension.clear();
-        if let Some(extension) = &data.extension {
+        if let Some(extension) = data.extension {
             self.down_hashed_key
                 .try_extend_from_slice(&extension[..])
                 .unwrap();
-            self.extension
-                .try_extend_from_slice(&extension[..])
-                .unwrap();
+            self.extension = extension;
         }
 
         self.apk = data.apk;
@@ -354,29 +352,19 @@ impl Debug for CellPayload {
     }
 }
 
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct BranchData {
-    pub touch_map: u16,
-    pub after_map: u16,
+    pub touch_map: BranchBitmap,
+    pub after_map: BranchBitmap,
     pub payload: Vec<CellPayload>,
-}
-
-impl Debug for BranchData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BranchData")
-            .field("touch_map", &format_args!("{:#018b}", self.touch_map))
-            .field("after_map", &format_args!("{:#018b}", self.after_map))
-            .field("payload", &self.payload)
-            .finish()
-    }
 }
 
 impl BranchData {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(2 + 2);
 
-        out.extend_from_slice(&self.touch_map.to_be_bytes());
-        out.extend_from_slice(&self.after_map.to_be_bytes());
+        out.extend_from_slice(&self.touch_map.0.to_be_bytes());
+        out.extend_from_slice(&self.after_map.0.to_be_bytes());
 
         for payload in &self.payload {
             out.push(payload.field_bits);
@@ -420,10 +408,10 @@ impl BranchData {
         }
 
         ensure!(buf.len() >= pos + 4);
-        let touch_map = u16::from_be_bytes(*array_ref!(buf, pos, 2));
+        let touch_map = BranchBitmap(u16::from_be_bytes(*array_ref!(buf, pos, 2)));
         pos += 2;
 
-        let after_map = u16::from_be_bytes(*array_ref!(buf, pos, 2));
+        let after_map = BranchBitmap(u16::from_be_bytes(*array_ref!(buf, pos, 2)));
         pos += 2;
 
         let mut payload = vec![];
@@ -511,6 +499,70 @@ pub trait State {
     fn fetch_storage(&mut self, address: Address, location: H256) -> anyhow::Result<Option<U256>>;
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct BranchBitmap(pub u16);
+
+impl BranchBitmap {
+    pub fn parts(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    pub fn has(self, nibble: u8) -> bool {
+        self.0 & (1_u16 << nibble as u16) != 0
+    }
+
+    pub fn from_nibble(nibble: u8) -> Self {
+        Self(1_u16 << nibble as u16)
+    }
+
+    pub fn add_nibble(&mut self, nibble: u8) {
+        self.0 |= 1_u16 << nibble as u16;
+    }
+
+    pub fn remove_nibble(&mut self, nibble: u8) {
+        self.0 &= !(1_u16 << nibble as u16)
+    }
+
+    pub fn iter(self) -> NibbleIterator {
+        NibbleIterator(self.0)
+    }
+
+    pub fn clear(&mut self) {
+        self.0 = 0;
+    }
+}
+
+impl Debug for BranchBitmap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:016b}", self.0)
+    }
+}
+
+impl Display for BranchBitmap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:016b}", self.0)
+    }
+}
+
+pub struct NibbleIterator(u16);
+
+impl Iterator for NibbleIterator {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.0 != 0 {
+            let bit = self.0 & 0_u16.overflowing_sub(self.0).0;
+            let nibble = bit.trailing_zeros();
+
+            self.0 ^= bit;
+
+            Some(nibble.try_into().unwrap())
+        } else {
+            None
+        }
+    }
+}
+
 /// HexPatriciaHashed implements commitment based on patricia merkle tree with radix 16,
 /// with keys pre-hashed by keccak256
 #[derive(Debug)]
@@ -529,8 +581,8 @@ pub struct HexPatriciaHashed<'state, S: State> {
     root_touched: bool,
     root_present: bool,
     branch_before: [bool; 128], // For each row, whether there was a branch node in the database loaded in unfold
-    touch_map: [u16; 128], // For each row, bitmap of cells that were either present before modification, or modified or deleted
-    after_map: [u16; 128], // For each row, bitmap of cells that were present after modification
+    touch_map: [BranchBitmap; 128], // For each row, bitmap of cells that were either present before modification, or modified or deleted
+    after_map: [BranchBitmap; 128], // For each row, bitmap of cells that were present after modification
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -558,8 +610,8 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             root_touched: Default::default(),
             root_present: Default::default(),
             branch_before: [false; 128],
-            touch_map: [0; 128],
-            after_map: [0; 128],
+            touch_map: [Default::default(); 128],
+            after_map: [Default::default(); 128],
         }
     }
 
@@ -836,32 +888,32 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             return Ok(());
         }
 
-        let branch_data = branch_data.unwrap();
+        let branch_data =
+            branch_data.ok_or_else(|| format_err!("branch data unexpectedly absent"))?;
         self.branch_before[row] = true;
         let bitmap = branch_data.touch_map;
         if deleted {
             // All cells come as deleted (touched but not present after)
-            self.after_map[row] = 0;
+            self.after_map[row] = Default::default();
             self.touch_map[row] = bitmap;
         } else {
             self.after_map[row] = bitmap;
-            self.touch_map[row] = 0;
+            self.touch_map[row] = Default::default();
         }
-        // Loop iterating over the set bits of modMask
-        let mut bitset = bitmap;
-        let mut cell_payload_iter = branch_data.payload.iter();
-        while bitset != 0 {
-            let bit = bitset & 0_u16.overflowing_sub(bitset).0;
-            let nibble = bit.trailing_zeros();
+        if bitmap.parts() != branch_data.payload.len() {
+            bail!(
+                "len mismatch {} != {}",
+                bitmap.parts(),
+                branch_data.payload.len()
+            );
+        }
+
+        for (nibble, cell_payload) in bitmap.iter().zip(branch_data.payload.into_iter()) {
             let cell = self.grid.grid_cell_mut(CellPosition {
                 row,
                 col: nibble as usize,
             });
-            cell.fill_from_fields(
-                cell_payload_iter
-                    .next()
-                    .ok_or_else(|| format_err!("empty"))?,
-            );
+            cell.fill_from_fields(cell_payload);
             trace!(
                 "cell ({}, {:x}) depth={}, hash=[{:?}], a=[{:?}], s=[{:?}], ex=[{}]",
                 row,
@@ -885,7 +937,6 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 cell.fill_from_storage(self.state.fetch_storage(account, location)?);
             }
             cell.derive_hashed_keys(depth)?;
-            bitset ^= bit;
         }
 
         Ok(())
@@ -918,8 +969,8 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                     col: col as usize,
                 })
                 .clone();
-            touched = self.touch_map[self.active_rows - 1] & (1_u16 << col as u16) != 0;
-            present = self.after_map[self.active_rows - 1] & (1_u16 << col as u16) != 0;
+            touched = self.touch_map[self.active_rows - 1].has(col);
+            present = self.after_map[self.active_rows - 1].has(col);
             trace!(
                 "upCell ({}, {:x}), touched {}, present {}",
                 self.active_rows - 1,
@@ -931,8 +982,8 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         };
         let row = self.active_rows;
         self.grid.clear_row(row);
-        self.touch_map[row] = 0;
-        self.after_map[row] = 0;
+        self.touch_map[row].clear();
+        self.after_map[row].clear();
         self.branch_before[row] = false;
         if up_cell.down_hashed_key.is_empty() {
             depth = up_depth + 1;
@@ -941,10 +992,10 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             depth = up_depth + unfolding;
             let nibble = up_cell.down_hashed_key[unfolding - 1];
             if touched {
-                self.touch_map[row] = 1_u16 << nibble;
+                self.touch_map[row] = BranchBitmap::from_nibble(nibble);
             }
             if present {
-                self.after_map[row] = 1_u16 << nibble;
+                self.after_map[row] = BranchBitmap::from_nibble(nibble);
             }
             let cell = self.grid.grid_cell_mut(CellPosition {
                 row,
@@ -965,10 +1016,10 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             depth = up_depth + up_cell.down_hashed_key.len();
             let nibble = *up_cell.down_hashed_key.last().unwrap();
             if touched {
-                self.touch_map[row] = 1_u16 << nibble;
+                self.touch_map[row] = BranchBitmap::from_nibble(nibble);
             }
             if present {
-                self.after_map[row] = 1_u16 << nibble;
+                self.after_map[row] = BranchBitmap::from_nibble(nibble);
             }
             let cell = self.grid.grid_cell_mut(CellPosition {
                 row,
@@ -997,7 +1048,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         !hashed_key[..].starts_with(&self.current_key[..])
     }
 
-    #[instrument(skip(self), fields(active_rows=self.active_rows, current_key=&*hex::encode(&self.current_key), touch_map=&*format!("{:#018b}", self.touch_map[self.active_rows - 1]), after_map=&*format!("{:#018b}", self.after_map[self.active_rows - 1])))]
+    #[instrument(skip(self), fields(active_rows=self.active_rows, current_key=&*hex::encode(&self.current_key), touch_map=&*self.touch_map[self.active_rows - 1].to_string(), after_map=&*self.after_map[self.active_rows - 1].to_string()))]
     pub(crate) fn fold(&mut self) -> (Option<BranchData>, Vec<u8>) {
         assert_ne!(self.active_rows, 0, "cannot fold - no active rows");
         // Move information to the row above
@@ -1024,18 +1075,18 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
 
         let update_key = hex_to_compact(&self.current_key);
         trace!(
-            "touch_map[{}]={:#018b}, after_map[{}]={:#018b}",
+            "touch_map[{}]={}, after_map[{}]={}",
             row,
             self.touch_map[row],
             row,
             self.after_map[row]
         );
 
-        let parts_count = self.after_map[row].count_ones();
+        let parts_count = self.after_map[row].parts();
         match parts_count {
             0 => {
                 // Everything deleted
-                if self.touch_map[row] != 0 {
+                if self.touch_map[row].parts() > 0 {
                     if row == 0 {
                         // Root is deleted because the tree is empty
                         self.root_touched = true;
@@ -1043,11 +1094,11 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                     } else if up_depth == 64 {
                         // Special case - all storage items of an account have been deleted, but it does not automatically delete the account, just makes it empty storage
                         // Therefore we are not propagating deletion upwards, but turn it into a modification
-                        self.touch_map[row - 1] |= 1_u16 << col;
+                        self.touch_map[row - 1].add_nibble(col);
                     } else {
                         // Deletion is propagated upwards
-                        self.touch_map[row - 1] |= 1_u16 << col;
-                        self.after_map[row - 1] &= !(1_u16 << col);
+                        self.touch_map[row - 1].add_nibble(col);
+                        self.after_map[row - 1].remove_nibble(col);
                     }
                 }
                 let up_cell = self.grid.cell_mut(up_cell);
@@ -1059,7 +1110,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 if self.branch_before[row] {
                     let branch_data = branch_data.get_or_insert_with(BranchData::default);
                     branch_data.touch_map = self.touch_map[row];
-                    branch_data.after_map = 0;
+                    branch_data.after_map.clear();
                 }
                 self.active_rows -= 1;
                 if up_depth > 0 {
@@ -1070,16 +1121,16 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             }
             1 => {
                 // Leaf or extension node
-                if self.touch_map[row] != 0 {
+                if self.touch_map[row].parts() != 0 {
                     // any modifications
                     if row == 0 {
                         self.root_touched = true;
                     } else {
                         // Modification is propagated upwards
-                        self.touch_map[row - 1] |= 1_u16 << col;
+                        self.touch_map[row - 1].add_nibble(col);
                     }
                 }
-                let nibble = self.after_map[row].trailing_zeros().try_into().unwrap();
+                let nibble = self.after_map[row].0.trailing_zeros().try_into().unwrap();
                 let low_cell = self
                     .grid
                     .grid_cell(CellPosition { row, col: nibble })
@@ -1097,7 +1148,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 if self.branch_before[row] {
                     let branch_data = branch_data.get_or_insert_with(BranchData::default);
                     branch_data.touch_map = self.touch_map[row];
-                    branch_data.after_map = 0;
+                    branch_data.after_map.clear();
                 }
                 self.active_rows -= 1;
 
@@ -1105,35 +1156,35 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
             }
             _ => {
                 // Branch node
-                if self.touch_map[row] != 0 {
+                if self.touch_map[row].parts() != 0 {
                     // any modifications
                     if row == 0 {
                         self.root_touched = true
                     } else {
                         // Modification is propagated upwards
-                        self.touch_map[row - 1] |= 1_u16 << col;
+                        self.touch_map[row - 1].add_nibble(col);
                     }
                 }
-                let mut bitmap = self.touch_map[row] & self.after_map[row];
+                let mut changed_and_present =
+                    BranchBitmap(self.touch_map[row].0 & self.after_map[row].0);
                 if !self.branch_before[row] {
                     // There was no branch node before, so we need to touch even the singular child that existed
-                    self.touch_map[row] |= self.after_map[row];
-                    bitmap |= self.after_map[row];
+                    self.touch_map[row].0 |= self.after_map[row].0;
+                    changed_and_present.0 |= self.after_map[row].0;
                 }
                 // Calculate total length of all hashes
                 let mut total_branch_len = 17 - parts_count as usize; // for every empty cell, one byte
-                {
-                    let mut bitset = self.after_map[row];
-                    while bitset != 0 {
-                        let bit = bitset & 0_u16.overflowing_sub(bitset).0;
-                        let nibble = bit.trailing_zeros() as usize;
-                        total_branch_len += self
-                            .grid
-                            .cell_mut(Some(CellPosition { row, col: nibble }))
-                            .compute_hash_len(depth);
-                        bitset ^= bit;
-                    }
+
+                for nibble in self.after_map[row].iter() {
+                    total_branch_len += self
+                        .grid
+                        .cell_mut(Some(CellPosition {
+                            row,
+                            col: nibble as usize,
+                        }))
+                        .compute_hash_len(depth);
                 }
+
                 let mut b = BranchData {
                     touch_map: self.touch_map[row],
                     after_map: self.after_map[row],
@@ -1145,53 +1196,50 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 hasher.update(&rlputil::generate_struct_len(total_branch_len));
 
                 let mut last_nibble = 0;
-                {
-                    let mut bitset = self.after_map[row];
-                    while bitset != 0 {
-                        let bit = bitset & 0_u16.overflowing_sub(bitset).0;
-                        let nibble = bit.trailing_zeros() as usize;
-                        for i in last_nibble..nibble {
-                            hasher.update(&[0x80]);
-                            trace!("{:x}: empty({},{:x})", i, row, i);
+
+                for nibble in self.after_map[row].iter() {
+                    for i in last_nibble..nibble {
+                        hasher.update(&[0x80]);
+                        trace!("{:x}: empty({},{:x})", i, row, i);
+                    }
+                    last_nibble = nibble + 1;
+                    let cell_pos = CellPosition {
+                        row,
+                        col: nibble as usize,
+                    };
+                    {
+                        let cell_hash = self.compute_cell_hash(Some(cell_pos), depth);
+                        hasher.update(cell_hash);
+                    }
+
+                    if changed_and_present.has(nibble) {
+                        let mut field_bits = 0_u8;
+
+                        let cell = self.grid.grid_cell_mut(cell_pos);
+                        if !cell.extension.is_empty() && cell.spk.is_some() {
+                            field_bits |= HASHEDKEY_PART;
                         }
-                        last_nibble = nibble + 1;
-                        let cell_pos = CellPosition { row, col: nibble };
-                        {
-                            let cell_hash = self.compute_cell_hash(Some(cell_pos), depth);
-                            hasher.update(cell_hash);
+                        if cell.apk.is_some() {
+                            field_bits |= ACCOUNT_PLAIN_PART;
                         }
-
-                        if bitmap & bit != 0 {
-                            let mut field_bits = 0_u8;
-
-                            let cell = self.grid.grid_cell_mut(cell_pos);
-                            if !cell.extension.is_empty() && cell.spk.is_some() {
-                                field_bits |= HASHEDKEY_PART;
-                            }
-                            if cell.apk.is_some() {
-                                field_bits |= ACCOUNT_PLAIN_PART;
-                            }
-                            if cell.spk.is_some() {
-                                field_bits |= STORAGE_PLAIN_PART;
-                            }
-                            if cell.h.is_some() {
-                                field_bits |= HASH_PART;
-                            }
-
-                            b.payload.push(CellPayload {
-                                field_bits,
-                                extension: if !cell.extension.is_empty() && cell.spk.is_some() {
-                                    Some(cell.extension.clone())
-                                } else {
-                                    None
-                                },
-                                apk: cell.apk,
-                                spk: cell.spk,
-                                h: cell.h,
-                            });
+                        if cell.spk.is_some() {
+                            field_bits |= STORAGE_PLAIN_PART;
+                        }
+                        if cell.h.is_some() {
+                            field_bits |= HASH_PART;
                         }
 
-                        bitset ^= bit;
+                        b.payload.push(CellPayload {
+                            field_bits,
+                            extension: if !cell.extension.is_empty() && cell.spk.is_some() {
+                                Some(cell.extension.clone())
+                            } else {
+                                None
+                            },
+                            apk: cell.apk,
+                            spk: cell.spk,
+                            h: cell.h,
+                        });
                     }
                 }
 
@@ -1261,12 +1309,15 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 );
                 return;
             }
-            let col = hashed_key[self.current_key.len()] as usize;
-            cell = self.grid.cell_mut(Some(CellPosition { row, col }));
-            if self.after_map[row] & 1_u16 << col != 0 {
+            let col = hashed_key[self.current_key.len()];
+            cell = self.grid.cell_mut(Some(CellPosition {
+                row,
+                col: col as usize,
+            }));
+            if self.after_map[row].has(col) {
                 // Prevent "spurious deletions", i.e. deletion of absent items
-                self.touch_map[row] |= 1_u16 << col as u16;
-                self.after_map[row] &= !(1_u16 << col as u16);
+                self.touch_map[row].add_nibble(col);
+                self.after_map[row].remove_nibble(col);
                 trace!("Setting ({}, {:x})", row, col);
             } else {
                 trace!("Ignoring ({}, {:x})", row, col);
@@ -1286,12 +1337,15 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         }
         let row = self.active_rows - 1;
         let depth = self.depths[row];
-        let col = hashed_key[self.current_key.len()] as usize;
-        let cell = self.grid.grid_cell_mut(CellPosition { row, col });
-        self.touch_map[row] |= 1_u16 << col as u16;
-        self.after_map[row] |= 1_u16 << col as u16;
+        let col = hashed_key[self.current_key.len()];
+        let cell = self.grid.grid_cell_mut(CellPosition {
+            row,
+            col: col as usize,
+        });
+        self.touch_map[row].add_nibble(col);
+        self.after_map[row].add_nibble(col);
         trace!(
-            "Setting ({}, {:x}), touch_map[{}]={:#018b}, depth={}",
+            "Setting ({}, {:x}), touch_map[{}]={}, depth={}",
             row,
             col,
             row,
@@ -1378,10 +1432,10 @@ fn has_term(s: &[u8]) -> bool {
 fn merge_hex_branches(old: &BranchData, new: &BranchData) -> anyhow::Result<BranchData> {
     let mut merged = BranchData::default();
 
-    let old_bitmap = old.touch_map & old.after_map;
-    let new_bitmap = new.touch_map & new.after_map;
+    let old_bitmap = old.touch_map.0 & old.after_map.0;
+    let new_bitmap = new.touch_map.0 & new.after_map.0;
 
-    merged.touch_map = old.touch_map | new.touch_map;
+    merged.touch_map = BranchBitmap(old.touch_map.0 | new.touch_map.0);
     merged.after_map = new.after_map;
 
     {
@@ -1398,7 +1452,7 @@ fn merge_hex_branches(old: &BranchData, new: &BranchData) -> anyhow::Result<Bran
             }
             if old_bitmap & bit != 0 {
                 // Add fields from old BranchData
-                if (new.touch_map & bit == 0) && (new.after_map & bit != 0) {
+                if (new.touch_map.0 & bit == 0) && (new.after_map.0 & bit != 0) {
                     merged
                         .payload
                         .push(old_payload_iter.next().context("no payload1")?.clone());
@@ -1685,14 +1739,22 @@ mod tests {
     }
 
     #[test]
+    fn bitmap_nibble_iterator() {
+        assert_eq!(
+            BranchBitmap(0b1000000110000000).iter().collect::<Vec<_>>(),
+            &[0x7, 0x8, 0xf]
+        );
+    }
+
+    #[test]
     fn branchdata_encoding() {
         for (buf, branch_data) in [
             (
                 &hex!("818081800434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000070434c783e610b30e83ecff161effbb7cd591dfccb722000000000000000000000000000000000000000000000000000000000000000e0434c783e610b30e83ecff161effbb7cd591dfccb7220000000000000000000000000000000000000000000000000000000000000004") as &[u8],
                 BranchData {
                     // 7, 8, f
-                    touch_map: 0b1000000110000000,
-                    after_map: 0b1000000110000000,
+                    touch_map: BranchBitmap(0b1000000110000000),
+                    after_map: BranchBitmap(0b1000000110000000),
                     payload: vec![
                         CellPayload {
                             field_bits: STORAGE_PLAIN_PART,
@@ -1721,8 +1783,8 @@ mod tests {
             (
                 &hex!("2f7f2f7f0434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000050901092084b6ffa0dc93412dbc5675a4856167d494f018749d04036ca7cbdd2b4c21141c0434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000060434c783e610b30e83ecff161effbb7cd591dfccb722000000000000000000000000000000000000000000000000000000000001000208209f4533f1b8b641fe63d28fd5c827deca05427b086575535adf8536b7c19571d40434c783e610b30e83ecff161effbb7cd591dfccb7220000000000000000000000000000000000000000000000000000000000010004082078e36b30cc9dace946d7e93f6f9fd2e1b1ca7aee38b5b483417f0fa95f05e6dc0434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000100050820e8a4584ec3838e5f013e695e14c7443acacd635a6bc90dd5165947dd712d9a6c0820c00d8050a3e3af1ec71d35ef3cc72ee99127680c96db1f439c7b04e9ea6badb90820356e9beaa88ef7b6fce769d2a711dae16df4b2916a66a2182d50be8e590fda3e0820151eba0a12fd97cbc70045e701fbe6b2c6d13141c147ae4f11f0e9259d816a45") as &[u8],
                 BranchData {
-                    touch_map: 0b0010111101111111,
-                    after_map: 0b0010111101111111,
+                    touch_map: BranchBitmap(0b0010111101111111),
+                    after_map: BranchBitmap(0b0010111101111111),
                     payload: vec![
                         CellPayload {
                             field_bits: STORAGE_PLAIN_PART,
