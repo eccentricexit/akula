@@ -1,5 +1,5 @@
 use super::*;
-use crate::{models::*, zeroless_view, StageId};
+use crate::{commitment::BranchData, models::*, zeroless_view, StageId};
 use anyhow::{bail, format_err};
 use arrayref::array_ref;
 use arrayvec::ArrayVec;
@@ -763,6 +763,20 @@ impl TableDecode for CallTraceSetEntry {
     }
 }
 
+impl TableEncode for BranchData {
+    type Encoded = Vec<u8>;
+
+    fn encode(self) -> Self::Encoded {
+        BranchData::encode(&self)
+    }
+}
+
+impl TableDecode for BranchData {
+    fn decode(b: &[u8]) -> anyhow::Result<Self> {
+        BranchData::decode(b, 0).map(|(v, _)| v)
+    }
+}
+
 decl_table!(Account => Address => crate::models::Account);
 decl_table!(Storage => Address => (H256, U256));
 decl_table!(AccountChangeSet => AccountChangeKey => AccountChange);
@@ -774,6 +788,7 @@ decl_table!(StorageHistory => BitmapKey<(Address, H256)> => RoaringTreemap);
 decl_table!(Code => H256 => Bytes);
 decl_table!(TrieAccount => Vec<u8> => Vec<u8>);
 decl_table!(TrieStorage => Vec<u8> => Vec<u8>);
+decl_table!(CommitmentBranch => Vec<u8> => BranchData);
 decl_table!(DbInfo => Vec<u8> => Vec<u8>);
 decl_table!(SnapshotInfo => Vec<u8> => Vec<u8>);
 decl_table!(BittorrentInfo => Vec<u8> => Vec<u8>);
@@ -825,6 +840,7 @@ pub static CHAINDATA_TABLES: Lazy<Arc<HashMap<&'static str, TableInfo>>> = Lazy:
         Code::const_db_name() => TableInfo::default(),
         TrieAccount::const_db_name() => TableInfo::default(),
         TrieStorage::const_db_name() => TableInfo::default(),
+        CommitmentBranch::const_db_name() => TableInfo::default(),
         DbInfo::const_db_name() => TableInfo::default(),
         SnapshotInfo::const_db_name() => TableInfo::default(),
         BittorrentInfo::const_db_name() => TableInfo::default(),
