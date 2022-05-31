@@ -1,4 +1,5 @@
 pub mod node;
+pub mod txpool;
 pub mod types;
 
 pub mod collections {

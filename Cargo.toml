@@ -134,6 +134,7 @@ hashbrown = { version = "0.12.0", features = [
     "nightly",
     "ahash-compile-time-rng",
 ] }
+dashmap = { git = "https://github.com/xacrimon/dashmap" }
 
 [features]
 default = []

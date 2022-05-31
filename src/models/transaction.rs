@@ -37,7 +37,7 @@ impl TryFrom<u8> for TxType {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Hash)]
 pub enum TransactionAction {
     Call(Address),
     Create,
@@ -135,7 +135,7 @@ impl YParityAndChainId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Hash)]
 pub struct MessageSignature {
     odd_y_parity: bool,
     r: H256,
@@ -190,7 +190,17 @@ impl MessageSignature {
 }
 
 #[derive(
-    Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, RlpEncodable, RlpDecodable,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Encode,
+    Decode,
+    RlpEncodable,
+    RlpDecodable,
+    Hash,
 )]
 pub struct AccessListItem {
     pub address: Address,
@@ -244,7 +254,7 @@ impl<'a> From<&'a Option<ChainId>> for OptionalChainId {
     }
 }
 
-#[derive(Clone, Educe, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Educe, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Hash)]
 #[educe(Debug)]
 pub enum Message {
     Legacy {
@@ -440,7 +450,7 @@ impl Message {
     }
 }
 
-#[derive(Clone, Debug, Deref, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Debug, Deref, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Hash)]
 pub struct MessageWithSignature {
     #[deref]
     pub message: Message,
