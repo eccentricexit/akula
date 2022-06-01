@@ -9,6 +9,7 @@ use super::{
 };
 use anyhow::{anyhow, bail, Context};
 use cidr::IpCidr;
+use dashmap::{mapref::entry::Entry, DashMap};
 use educe::Educe;
 use futures::sink::SinkExt;
 use lru::LruCache;
@@ -16,7 +17,7 @@ use parking_lot::Mutex;
 use rand::prelude::*;
 use secp256k1::SecretKey;
 use std::{
-    collections::{hash_map::Entry, BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap},
     fmt::Debug,
     future::Future,
     net::SocketAddr,
@@ -88,7 +89,7 @@ struct PeerState {
 #[derive(Debug)]
 struct PeerStreams {
     /// Mapping of remote IDs to streams in `StreamMap`
-    mapping: HashMap<PeerId, PeerState>,
+    mapping: DashMap<PeerId, PeerState>,
     semaphore: Arc<Semaphore>,
 }
 
@@ -100,7 +101,7 @@ impl PeerStreams {
         }
     }
 
-    fn disconnect_peer(&mut self, remote_id: PeerId) -> bool {
+    fn disconnect_peer(&self, remote_id: PeerId) -> bool {
         self.mapping.remove(&remote_id).is_some()
     }
 }
@@ -117,7 +118,7 @@ struct PeerStreamHandshakeData<C> {
 
 async fn handle_incoming<TS, C>(
     task_group: Weak<TaskGroup>,
-    streams: Arc<Mutex<PeerStreams>>,
+    streams: Arc<PeerStreams>,
     node_filter: Arc<Mutex<dyn NodeFilter>>,
     tcp_incoming: TS,
     handshake_data: PeerStreamHandshakeData<C>,
@@ -154,7 +155,7 @@ async fn handle_incoming<TS, C>(
 
 /// Set up newly connected peer's state, start its tasks
 fn setup_peer_state<C, Io>(
-    streams: Weak<Mutex<PeerStreams>>,
+    streams: Weak<PeerStreams>,
     capability_server: Arc<C>,
     remote_id: PeerId,
     peer: PeerStream<Io>,
@@ -328,7 +329,7 @@ where
             if let Some(streams) = streams.upgrade() {
                 // This is the last line guaranteed to be executed.
                 // After this the peer's task group is dropped and any alive tasks are forcibly cancelled.
-                streams.lock().disconnect_peer(remote_id);
+                streams.disconnect_peer(remote_id);
             }
         }
         .instrument(span!(
@@ -358,7 +359,7 @@ where
 
 /// Establishes the connection with peer and adds them to internal state.
 async fn handle_incoming_request<C, Io>(
-    streams: Arc<Mutex<PeerStreams>>,
+    streams: Arc<PeerStreams>,
     node_filter: Arc<Mutex<dyn NodeFilter>>,
     stream: Io,
     handshake_data: PeerStreamHandshakeData<C>,
@@ -391,12 +392,10 @@ async fn handle_incoming_request<C, Io>(
         Ok(peer) => {
             let remote_id = peer.remote_id();
             let s = streams.clone();
-            let mut s = s.lock();
             let node_filter = node_filter.clone();
-            let PeerStreams { mapping, semaphore } = &mut *s;
-            let total_connections = mapping.len();
+            let total_connections = s.mapping.len();
 
-            match mapping.entry(remote_id) {
+            match streams.mapping.entry(remote_id) {
                 Entry::Occupied(entry) => {
                     debug!(
                         "We are already {} to remote peer {}!",
@@ -409,21 +408,22 @@ async fn handle_incoming_request<C, Io>(
                     );
                 }
                 Entry::Vacant(entry) => {
-                    if let Ok(sem_permit) = semaphore.clone().try_acquire_owned() {
-                        if node_filter.lock().is_allowed(total_connections, remote_id) {
-                            debug!("New incoming peer connected: {}", remote_id);
+                    if node_filter.lock().is_allowed(total_connections, remote_id) {
+                        debug!("New incoming peer connected: {}", remote_id);
+                        let connection_state = PeerConnectionState::Connected(setup_peer_state(
+                            Arc::downgrade(&streams),
+                            capability_server,
+                            remote_id,
+                            peer,
+                        ));
+                        if let Ok(sem_permit) = s.semaphore.clone().try_acquire_owned() {
                             entry.insert(PeerState {
-                                connection_state: PeerConnectionState::Connected(setup_peer_state(
-                                    Arc::downgrade(&streams),
-                                    capability_server,
-                                    remote_id,
-                                    peer,
-                                )),
+                                connection_state,
                                 sem_permit,
                             });
-                        } else {
-                            trace!("Node filter rejected peer {}, disconnecting", remote_id);
                         }
+                    } else {
+                        trace!("Node filter rejected peer {}, disconnecting", remote_id);
                     }
                 }
             }
@@ -477,7 +477,7 @@ pub struct Swarm<C: CapabilityServer> {
     #[allow(unused)]
     tasks: Arc<TaskGroup>,
 
-    streams: Arc<Mutex<PeerStreams>>,
+    streams: Arc<PeerStreams>,
 
     currently_connecting: Arc<AtomicUsize>,
 
@@ -604,7 +604,7 @@ impl<C: CapabilityServer> Swarm<C> {
         let max_peers = listen_options
             .as_ref()
             .map_or(usize::MAX, |options| options.max_peers.get());
-        let streams = Arc::new(Mutex::new(PeerStreams::new(max_peers)));
+        let streams = Arc::new(PeerStreams::new(max_peers));
         let node_filter = Arc::new(Mutex::new(MemoryNodeFilter::new(Arc::new(
             max_peers.into(),
         ))));
@@ -758,8 +758,7 @@ impl<C: CapabilityServer> Swarm<C> {
             let currently_connecting = currently_connecting.clone();
             async move {
                 if rx.await.is_err() {
-                    let mut s = streams.lock();
-                    if let Entry::Occupied(entry) = s.mapping.entry(remote_id) {
+                    if let Entry::Occupied(entry) = streams.mapping.entry(remote_id) {
                         // If this is the same connection attempt, then remove.
                         if let PeerConnectionState::Connecting { connection_id } =
                             entry.get().connection_state
@@ -780,18 +779,9 @@ impl<C: CapabilityServer> Swarm<C> {
             let mut inserted = false;
 
             {
-                let semaphore = streams.lock().semaphore.clone();
-                trace!("Awaiting semaphore permit");
-                let sem_permit = match semaphore.acquire_owned().await {
-                    Ok(v) => v,
-                    Err(_) => return Ok(false),
-                };
-                trace!("Semaphore permit acquired");
+                let sema = streams.semaphore.clone();
 
                 currently_connecting.fetch_add(1, Ordering::SeqCst);
-
-                let mut streams = streams.lock();
-                let node_filter = node_filter.lock();
 
                 let connection_num = streams.mapping.len();
 
@@ -808,10 +798,19 @@ impl<C: CapabilityServer> Swarm<C> {
                         );
                     }
                     Entry::Vacant(vacant) => {
-                        if untrusted_peer && !node_filter.is_allowed(connection_num, remote_id) {
+                        if untrusted_peer
+                            && !node_filter.lock().is_allowed(connection_num, remote_id)
+                        {
                             trace!("rejecting peer {}", remote_id);
                         } else {
                             debug!("connecting to peer {} at {}", remote_id, addr);
+
+                            trace!("Awaiting semaphore permit");
+                            let sem_permit = match sema.acquire_owned().await {
+                                Ok(v) => v,
+                                Err(_) => return Ok(false),
+                            };
+                            trace!("Semaphore permit acquired");
 
                             vacant.insert(PeerState {
                                 connection_state: PeerConnectionState::Connecting { connection_id },
@@ -843,11 +842,9 @@ impl<C: CapabilityServer> Swarm<C> {
             .await;
 
             let streams = streams.clone();
-            let mut streams_guard = streams.lock();
-            let PeerStreams { mapping, .. } = &mut *streams_guard;
 
             // Adopt the new connection if the peer has not been dropped or superseded by incoming connection.
-            if let Entry::Occupied(mut peer_state) = mapping.entry(remote_id) {
+            if let Entry::Occupied(mut peer_state) = streams.mapping.entry(remote_id) {
                 if !peer_state.get().connection_state.is_connected() {
                     match peer_res {
                         Ok(peer) => {

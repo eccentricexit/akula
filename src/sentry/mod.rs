@@ -17,6 +17,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use cidr::IpCidr;
 use clap::Parser;
+use dashmap::{DashMap, DashSet};
 use devp2p::*;
 use educe::Educe;
 use ethereum_interfaces::sentry::{self, sentry_server::SentryServer, InboundMessage, PeerEvent};
@@ -127,12 +128,12 @@ impl BlockTracker {
 #[educe(Debug)]
 pub struct CapabilityServerImpl {
     #[educe(Debug(ignore))]
-    pub peer_pipes: Arc<RwLock<HashMap<PeerId, Pipes>>>,
+    pub peer_pipes: Arc<DashMap<PeerId, Pipes>>,
     block_tracker: Arc<RwLock<BlockTracker>>,
 
     status_message: Arc<RwLock<Option<FullStatusData>>>,
     protocol_version: EthProtocolVersion,
-    valid_peers: Arc<RwLock<HashSet<PeerId>>>,
+    valid_peers: Arc<DashSet<PeerId>>,
 
     data_sender: BroadcastSender<InboundMessage>,
     peers_status_sender: BroadcastSender<PeerEvent>,
@@ -159,40 +160,33 @@ impl CapabilityServerImpl {
     }
 
     fn setup_peer(&self, peer: PeerId, p: Pipes) {
-        let mut pipes = self.peer_pipes.write();
-        let mut block_tracker = self.block_tracker.write();
-
-        assert!(pipes.insert(peer, p).is_none());
-        block_tracker.set_block_number(peer, 0, true);
+        self.peer_pipes.insert(peer, p);
+        self.block_tracker.write().set_block_number(peer, 0, true);
     }
 
     fn get_pipes(&self, peer: PeerId) -> Option<Pipes> {
-        self.peer_pipes.read().get(&peer).cloned()
+        self.peer_pipes
+            .get(&peer)
+            .map(|entry_ref| entry_ref.value().clone())
     }
 
     pub fn sender(&self, peer: PeerId) -> Option<OutboundSender> {
         self.peer_pipes
-            .read()
             .get(&peer)
-            .map(|pipes| pipes.sender.clone())
+            .map(|entry_ref| entry_ref.value().sender.clone())
     }
 
     fn receiver(&self, peer: PeerId) -> Option<OutboundReceiver> {
         self.peer_pipes
-            .read()
             .get(&peer)
-            .map(|pipes| pipes.receiver.clone())
+            .map(|entry_ref| entry_ref.value().receiver.clone())
     }
 
     #[instrument(name = "CapabilityServerImpl.teardown_peer", skip(self))]
     fn teardown_peer(&self, peer: PeerId) {
-        let mut pipes = self.peer_pipes.write();
-        let mut block_tracker = self.block_tracker.write();
-        let mut valid_peers = self.valid_peers.write();
-
-        pipes.remove(&peer);
-        block_tracker.remove_peer(peer);
-        valid_peers.remove(&peer);
+        self.block_tracker.write().remove_peer(peer);
+        self.peer_pipes.remove(&peer);
+        self.valid_peers.remove(&peer);
 
         let send_status_result =
             self.peers_status_sender
@@ -207,11 +201,14 @@ impl CapabilityServerImpl {
     }
 
     pub fn all_peers(&self) -> HashSet<PeerId> {
-        self.peer_pipes.read().keys().copied().collect()
+        self.peer_pipes
+            .iter()
+            .map(|entry_ref| *entry_ref.key())
+            .collect()
     }
 
     pub fn connected_peers(&self) -> usize {
-        self.valid_peers.read().len()
+        self.valid_peers.len()
     }
 
     pub fn set_status(&self, message: FullStatusData) {
@@ -230,7 +227,7 @@ impl CapabilityServerImpl {
                 message: Message { id, data },
                 ..
             } => {
-                let valid_peer = self.valid_peers.read().contains(&peer);
+                let valid_peer = self.valid_peers.contains(&peer);
                 let message_id = EthMessageId::from_usize(id);
                 match message_id {
                     None => {
@@ -253,7 +250,7 @@ impl CapabilityServerImpl {
                                 DisconnectReason::UselessPeer
                             })?;
 
-                            self.valid_peers.write().insert(peer);
+                            self.valid_peers.insert(peer);
 
                             let _ = self
                                 .peers_status_sender

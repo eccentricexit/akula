@@ -82,12 +82,12 @@ impl TransactionPool {
             .iter()
             .map(|entry_ref| *entry_ref.key())
             .collect::<Vec<_>>();
-        let batches: Vec<Vec<H256>> = known_copy.chunks(4).map(ToOwned::to_owned).collect();
 
         let sqrt_peers = self.node.sqrt_peers().await;
 
-        let _ = batches
-            .into_iter()
+        known_copy
+            .chunks(4)
+            .map(ToOwned::to_owned)
             .map(|batch| {
                 tokio::spawn({
                     let handler = self.clone();
