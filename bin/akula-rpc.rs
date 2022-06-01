@@ -23,6 +23,9 @@ pub struct Opt {
     pub listen_address: SocketAddr,
 }
 
+/// 128 MiB.
+const BODY_CAP: u32 = 128 * 1024 * 1024;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
@@ -32,13 +35,15 @@ async fn main() -> anyhow::Result<()> {
     let db: Arc<MdbxWithDirHandle<NoWriteMap>> = Arc::new(
         MdbxEnvironment::<NoWriteMap>::open_ro(
             mdbx::Environment::new(),
-            &opt.datadir,
+            &opt.datadir.chain_data_dir(),
             akula::kv::tables::CHAINDATA_TABLES.clone(),
         )?
         .into(),
     );
 
     let server = HttpServerBuilder::default()
+        .max_request_body_size(BODY_CAP)
+        .max_response_body_size(BODY_CAP)
         .build(opt.listen_address)
         .await?;
 
