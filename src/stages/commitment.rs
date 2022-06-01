@@ -22,6 +22,8 @@ use std::{
 };
 use tracing::*;
 
+const COMMITMENT_CHUNK: usize = 90_000;
+
 pub enum Change {
     Account(Address),
     Storage(Address, H256),
@@ -124,7 +126,7 @@ where
         if max_block > past_progress {
             let change_iter = gather_changes(tx, past_progress + 1)
                 .take_while(ttw(|(block_number, _)| *block_number <= max_block))
-                .chunks(90_000);
+                .chunks(COMMITMENT_CHUNK);
 
             let mut state_root =
                 crate::accessors::chain::header::read_canonical(tx, past_progress)?
