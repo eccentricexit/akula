@@ -1,3 +1,4 @@
+pub mod generic;
 pub mod rlputil;
 
 use self::rlputil::*;
@@ -817,7 +818,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         let mut depth = 0_usize;
         if self.active_rows == 0 {
             trace!("root");
-            cell = self.grid.cell(None);
+            cell = self.grid.root();
             if cell.down_hashed_key.is_empty() && cell.h.is_none() && !self.root_checked {
                 // Need to attempt to unfold the root
                 return 1;
@@ -950,7 +951,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         let depth;
         let up_cell;
         if self.active_rows == 0 {
-            let root = self.grid.cell(None);
+            let root = self.grid.root();
             if self.root_checked && root.h.is_none() && root.down_hashed_key.is_empty() {
                 // No unfolding for empty root
                 return Ok(());
@@ -1216,7 +1217,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                         let mut field_bits = 0_u8;
 
                         let cell = self.grid.grid_cell_mut(cell_pos);
-                        if !cell.extension.is_empty() && cell.spk.is_some() {
+                        if !cell.extension.is_empty() && cell.spk.is_none() {
                             field_bits |= HASHEDKEY_PART;
                         }
                         if cell.apk.is_some() {
@@ -1231,7 +1232,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
 
                         b.payload.push(CellPayload {
                             field_bits,
-                            extension: if !cell.extension.is_empty() && cell.spk.is_some() {
+                            extension: if !cell.extension.is_empty() && cell.spk.is_none() {
                                 Some(cell.extension.clone())
                             } else {
                                 None
