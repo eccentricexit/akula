@@ -1,5 +1,10 @@
 use super::{rlputil::*, *};
-use crate::{crypto::keccak256, models::*, prefix_length};
+use crate::{
+    crypto::keccak256,
+    kv::traits::{TableDecode, TableEncode, TableObject},
+    models::*,
+    prefix_length,
+};
 use anyhow::{bail, ensure, format_err, Context};
 use arrayvec::ArrayVec;
 use bytes::BytesMut;
@@ -9,36 +14,10 @@ use std::{
     fmt::Debug,
 };
 use tracing::*;
-
-fn uvarint(buf: &[u8]) -> Option<(u64, usize)> {
-    let mut x = 0;
-    let mut s = 0;
-    for (i, b) in buf.iter().copied().enumerate() {
-        if i == 10 {
-            return None;
-        }
-        if b < 0x80 {
-            if i == 9 && b > 1 {
-                return None;
-            }
-            return Some(((x | b << s).into(), i + 1));
-        }
-        x |= (b & 0x7f) << s as u64;
-        s += 7;
-    }
-    Some((0, 0))
-}
-
-fn encode_uvarint(out: &mut Vec<u8>, mut x: u64) {
-    while x >= 0x80 {
-        out.push(x as u8 | 0x80);
-        x >>= 7;
-    }
-    out.push(x as u8);
-}
+use unsigned_varint::encode::usize_buffer;
 
 fn encode_slice(out: &mut Vec<u8>, s: &[u8]) {
-    encode_uvarint(out, s.len() as u64);
+    out.extend_from_slice(unsigned_varint::encode::usize(s.len(), &mut usize_buffer()));
     out.extend_from_slice(s);
 }
 
@@ -184,138 +163,117 @@ impl<K> Default for BranchData<K> {
     }
 }
 
-impl<K> BranchData<K> {
-    // pub fn encode(&self) -> Vec<u8> {
-    //     let mut out = Vec::with_capacity(2 + 2);
+impl<K> BranchData<K>
+where
+    K: TableObject + Clone,
+{
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + 2);
 
-    //     out.extend_from_slice(&self.touch_map.0.to_be_bytes());
-    //     out.extend_from_slice(&self.after_map.0.to_be_bytes());
+        out.extend_from_slice(&self.touch_map.0.to_be_bytes());
+        out.extend_from_slice(&self.after_map.0.to_be_bytes());
 
-    //     for payload in &self.payload {
-    //         out.push(payload.field_bits);
-    //         if let Some(extension) = &payload.extension {
-    //             encode_slice(&mut out, &extension[..]);
-    //         }
-    //         if let Some(apk) = &payload.apk {
-    //             encode_slice(&mut out, &apk[..]);
-    //         }
-    //         if let Some((addr, location)) = &payload.spk {
-    //             let mut spk = [0; H160::len_bytes() + H256::len_bytes()];
-    //             spk[..H160::len_bytes()].copy_from_slice(&addr.0);
-    //             spk[H160::len_bytes()..].copy_from_slice(&location.0);
-    //             encode_slice(&mut out, &spk[..]);
-    //         }
-    //         if let Some(h) = &payload.h {
-    //             encode_slice(&mut out, &h[..]);
-    //         }
-    //     }
+        for payload in &self.payload {
+            out.push(payload.field_bits);
+            if let Some(extension) = &payload.extension {
+                encode_slice(&mut out, &extension[..]);
+            }
+            if let Some(plain_key) = &payload.plain_key {
+                encode_slice(&mut out, TableEncode::encode(plain_key.clone()).as_ref());
+            }
+            if let Some(hash) = &payload.hash {
+                encode_slice(&mut out, &hash[..]);
+            }
+        }
 
-    //     out
-    // }
+        out
+    }
 
-    // pub fn decode(buf: &[u8], mut pos: usize) -> anyhow::Result<(Self, usize)> {
-    //     fn extract_length(data: &[u8], mut pos: usize) -> anyhow::Result<(usize, usize)> {
-    //         let (l, n) =
-    //             uvarint(&data[pos..]).ok_or_else(|| format_err!("value overflow for len"))?;
-    //         if n == 0 {
-    //             bail!("buffer too small for len");
-    //         }
+    pub fn decode(buf: &[u8], mut pos: usize) -> anyhow::Result<(Self, usize)> {
+        fn extract_length(data: &[u8], mut pos: usize) -> anyhow::Result<(usize, usize)> {
+            let mut n = data[pos..].len();
+            let (l, rem) = unsigned_varint::decode::usize(&data[pos..])?;
+            n -= rem.len();
 
-    //         pos += n;
+            pos += n;
 
-    //         let l = l as usize;
+            let l = l as usize;
 
-    //         if data.len() < pos + l {
-    //             bail!("buffer too small for value");
-    //         }
+            if data.len() < pos + l {
+                bail!("buffer too small for value");
+            }
 
-    //         Ok((pos, l))
-    //     }
+            Ok((pos, l))
+        }
 
-    //     ensure!(buf.len() >= pos + 4);
-    //     let touch_map = BranchBitmap(u16::from_be_bytes(*array_ref!(buf, pos, 2)));
-    //     pos += 2;
+        ensure!(buf.len() >= pos + 4);
+        let touch_map = BranchBitmap(u16::from_be_bytes(*array_ref!(buf, pos, 2)));
+        pos += 2;
 
-    //     let after_map = BranchBitmap(u16::from_be_bytes(*array_ref!(buf, pos, 2)));
-    //     pos += 2;
+        let after_map = BranchBitmap(u16::from_be_bytes(*array_ref!(buf, pos, 2)));
+        pos += 2;
 
-    //     let mut payload = vec![];
-    //     while buf.len() != pos {
-    //         let field_bits = buf[pos];
-    //         pos += 1;
+        let mut payload = vec![];
+        while buf.len() != pos {
+            let field_bits = buf[pos];
+            pos += 1;
 
-    //         let mut extension = None;
-    //         if field_bits & HASHEDKEY_PART != 0 {
-    //             let l;
-    //             (pos, l) = extract_length(buf, pos)?;
+            let mut extension = None;
+            if field_bits & HASHEDKEY_PART != 0 {
+                let l;
+                (pos, l) = extract_length(buf, pos)?;
 
-    //             if l > 0 {
-    //                 let mut v = ArrayVec::new();
-    //                 v.try_extend_from_slice(&buf[pos..pos + l])?;
-    //                 extension = Some(v);
-    //                 pos += l;
-    //             }
-    //         }
+                if l > 0 {
+                    let mut v = ArrayVec::new();
+                    v.try_extend_from_slice(&buf[pos..pos + l])?;
+                    extension = Some(v);
+                    pos += l;
+                }
+            }
 
-    //         let mut apk = None;
-    //         if field_bits & ACCOUNT_PLAIN_PART != 0 {
-    //             let l;
-    //             (pos, l) = extract_length(buf, pos)?;
+            let mut plain_key = None;
+            if field_bits & PLAINKEY_PART != 0 {
+                let l;
+                (pos, l) = extract_length(buf, pos)?;
 
-    //             if l > 0 {
-    //                 ensure!(l == ADDRESS_LENGTH);
-    //                 apk = Some(Address::from_slice(&buf[pos..pos + l]));
-    //                 pos += l;
-    //             }
-    //         }
+                if l > 0 {
+                    plain_key = Some(TableDecode::decode(
+                        buf.get(pos..pos + l)
+                            .ok_or_else(|| format_err!("too short"))?,
+                    )?);
+                    pos += l;
+                }
+            }
 
-    //         let mut spk = None;
-    //         if field_bits & STORAGE_PLAIN_PART != 0 {
-    //             let l;
-    //             (pos, l) = extract_length(buf, pos)?;
+            let mut hash = None;
+            if field_bits & HASH_PART != 0 {
+                let l;
+                (pos, l) = extract_length(buf, pos)?;
 
-    //             if l > 0 {
-    //                 ensure!(l == ADDRESS_LENGTH + KECCAK_LENGTH);
-    //                 spk = Some((
-    //                     Address::from_slice(&buf[pos..pos + ADDRESS_LENGTH]),
-    //                     H256::from_slice(
-    //                         &buf[pos + ADDRESS_LENGTH..pos + ADDRESS_LENGTH + KECCAK_LENGTH],
-    //                     ),
-    //                 ));
-    //                 pos += l;
-    //             }
-    //         }
+                if l > 0 {
+                    ensure!(l == KECCAK_LENGTH);
+                    hash = Some(H256::from_slice(&buf[pos..pos + KECCAK_LENGTH]));
+                    pos += l;
+                }
+            }
 
-    //         let mut h = None;
-    //         if field_bits & HASH_PART != 0 {
-    //             let l;
-    //             (pos, l) = extract_length(buf, pos)?;
+            payload.push(StoredCell {
+                field_bits,
+                extension,
+                plain_key,
+                hash,
+            });
+        }
 
-    //             if l > 0 {
-    //                 ensure!(l == KECCAK_LENGTH);
-    //                 h = Some(H256::from_slice(&buf[pos..pos + KECCAK_LENGTH]));
-    //                 pos += l;
-    //             }
-    //         }
-
-    //         payload.push(CellPayload {
-    //             field_bits,
-    //             extension,
-    //             apk,
-    //             spk,
-    //             h,
-    //         });
-    //     }
-
-    //     Ok((
-    //         Self {
-    //             touch_map,
-    //             after_map,
-    //             payload,
-    //         },
-    //         pos,
-    //     ))
-    // }
+        Ok((
+            Self {
+                touch_map,
+                after_map,
+                payload,
+            },
+            pos,
+        ))
+    }
 }
 
 pub trait State<K, V> {
@@ -1336,139 +1294,125 @@ mod tests {
     fn branchdata_encoding() {
         for (buf, branch_data) in [
             (
-                &hex!("818081800434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000070434c783e610b30e83ecff161effbb7cd591dfccb722000000000000000000000000000000000000000000000000000000000000000e0434c783e610b30e83ecff161effbb7cd591dfccb7220000000000000000000000000000000000000000000000000000000000000004") as &[u8],
+                &hex!("818081800234c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000070234c783e610b30e83ecff161effbb7cd591dfccb722000000000000000000000000000000000000000000000000000000000000000e0234c783e610b30e83ecff161effbb7cd591dfccb7220000000000000000000000000000000000000000000000000000000000000004") as &[u8],
                 BranchData {
                     // 7, 8, f
                     touch_map: BranchBitmap(0b1000000110000000),
                     after_map: BranchBitmap(0b1000000110000000),
                     payload: vec![
-                        CellPayload {
-                            field_bits: STORAGE_PLAIN_PART,
+                        StoredCell {
+                            field_bits: PLAINKEY_PART,
                             extension: None,
-                            apk: None,
-                            spk: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("0000000000000000000000000000000000000000000000000000000000000007")))),
-                            h: None,
+                            plain_key: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("0000000000000000000000000000000000000000000000000000000000000007")))),
+                            hash: None,
                         },
-                        CellPayload {
-                            field_bits: STORAGE_PLAIN_PART,
+                        StoredCell {
+                            field_bits: PLAINKEY_PART,
                             extension: None,
-                            apk: None,
-                            spk: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("000000000000000000000000000000000000000000000000000000000000000e")))),
-                            h: None,
+                            plain_key: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("000000000000000000000000000000000000000000000000000000000000000e")))),
+                            hash: None,
                         },
-                        CellPayload {
-                            field_bits: STORAGE_PLAIN_PART,
+                        StoredCell {
+                            field_bits: PLAINKEY_PART,
                             extension: None,
-                            apk: None,
-                            spk: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("0000000000000000000000000000000000000000000000000000000000000004")))),
-                            h: None,
+                            plain_key: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("0000000000000000000000000000000000000000000000000000000000000004")))),
+                            hash: None,
                         },
                     ],
                 },
             ),
-    //         (
-    //             &hex!("2f7f2f7f0434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000050901092084b6ffa0dc93412dbc5675a4856167d494f018749d04036ca7cbdd2b4c21141c0434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000060434c783e610b30e83ecff161effbb7cd591dfccb722000000000000000000000000000000000000000000000000000000000001000208209f4533f1b8b641fe63d28fd5c827deca05427b086575535adf8536b7c19571d40434c783e610b30e83ecff161effbb7cd591dfccb7220000000000000000000000000000000000000000000000000000000000010004082078e36b30cc9dace946d7e93f6f9fd2e1b1ca7aee38b5b483417f0fa95f05e6dc0434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000100050820e8a4584ec3838e5f013e695e14c7443acacd635a6bc90dd5165947dd712d9a6c0820c00d8050a3e3af1ec71d35ef3cc72ee99127680c96db1f439c7b04e9ea6badb90820356e9beaa88ef7b6fce769d2a711dae16df4b2916a66a2182d50be8e590fda3e0820151eba0a12fd97cbc70045e701fbe6b2c6d13141c147ae4f11f0e9259d816a45") as &[u8],
-    //             BranchData {
-    //                 touch_map: BranchBitmap(0b0010111101111111),
-    //                 after_map: BranchBitmap(0b0010111101111111),
-    //                 payload: vec![
-    //                     CellPayload {
-    //                         field_bits: STORAGE_PLAIN_PART,
-    //                         extension: None,
-    //                         apk: None,
-    //                         spk: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000000005").into())),
-    //                         h: None,
-    //                     },
-    //                     CellPayload {
-    //                         field_bits: HASHEDKEY_PART | HASH_PART,
-    //                         extension: Some({
-    //                             let mut out = ArrayVec::new();
-    //                             out.push(0x09);
-    //                             out
-    //                         }),
-    //                         apk: None,
-    //                         spk: None,
-    //                         h: Some(hex!("84b6ffa0dc93412dbc5675a4856167d494f018749d04036ca7cbdd2b4c21141c").into()),
-    //                     },
-    //                     CellPayload {
-    //                         field_bits: STORAGE_PLAIN_PART,
-    //                         extension: None,
-    //                         apk: None,
-    //                         spk: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000000006").into())),
-    //                         h: None,
-    //                     },
-    //                     CellPayload {
-    //                         field_bits: STORAGE_PLAIN_PART,
-    //                         extension: None,
-    //                         apk: None,
-    //                         spk: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000010002").into())),
-    //                         h: None,
-    //                     },
-    //                     CellPayload {
-    //                         field_bits: HASH_PART,
-    //                         extension: None,
-    //                         apk: None,
-    //                         spk: None,
-    //                         h: Some(hex!("9f4533f1b8b641fe63d28fd5c827deca05427b086575535adf8536b7c19571d4").into()),
-    //                     },
-    //                     CellPayload {
-    //                         field_bits: STORAGE_PLAIN_PART,
-    //                         extension: None,
-    //                         apk: None,
-    //                         spk: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000010004").into())),
-    //                         h: None,
-    //                     },
-    //                     CellPayload {
-    //                         field_bits: HASH_PART,
-    //                         extension: None,
-    //                         apk: None,
-    //                         spk: None,
-    //                         h: Some(hex!("78e36b30cc9dace946d7e93f6f9fd2e1b1ca7aee38b5b483417f0fa95f05e6dc").into()),
-    //                     },
-    //                     CellPayload {
-    //                         field_bits: STORAGE_PLAIN_PART,
-    //                         extension: None,
-    //                         apk: None,
-    //                         spk: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000010005").into())),
-    //                         h: None,
-    //                     },
-    //                     CellPayload {
-    //                         field_bits: HASH_PART,
-    //                         extension: None,
-    //                         apk: None,
-    //                         spk: None,
-    //                         h: Some(hex!("e8a4584ec3838e5f013e695e14c7443acacd635a6bc90dd5165947dd712d9a6c").into()),
-    //                     },
-    //                     CellPayload {
-    //                         field_bits: HASH_PART,
-    //                         extension: None,
-    //                         apk: None,
-    //                         spk: None,
-    //                         h: Some(hex!("c00d8050a3e3af1ec71d35ef3cc72ee99127680c96db1f439c7b04e9ea6badb9").into()),
-    //                     },
-    //                     CellPayload {
-    //                         field_bits: HASH_PART,
-    //                         extension: None,
-    //                         apk: None,
-    //                         spk: None,
-    //                         h: Some(hex!("356e9beaa88ef7b6fce769d2a711dae16df4b2916a66a2182d50be8e590fda3e").into()),
-    //                     },
-    //                     CellPayload {
-    //                         field_bits: HASH_PART,
-    //                         extension: None,
-    //                         apk: None,
-    //                         spk: None,
-    //                         h: Some(hex!("151eba0a12fd97cbc70045e701fbe6b2c6d13141c147ae4f11f0e9259d816a45").into()),
-    //                     },
-    //                 ]
-    //             }
-    //         )
+            (
+                &hex!("2f7f2f7f0234c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000050901092084b6ffa0dc93412dbc5675a4856167d494f018749d04036ca7cbdd2b4c21141c0234c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000060234c783e610b30e83ecff161effbb7cd591dfccb722000000000000000000000000000000000000000000000000000000000001000208209f4533f1b8b641fe63d28fd5c827deca05427b086575535adf8536b7c19571d40234c783e610b30e83ecff161effbb7cd591dfccb7220000000000000000000000000000000000000000000000000000000000010004082078e36b30cc9dace946d7e93f6f9fd2e1b1ca7aee38b5b483417f0fa95f05e6dc0234c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000100050820e8a4584ec3838e5f013e695e14c7443acacd635a6bc90dd5165947dd712d9a6c0820c00d8050a3e3af1ec71d35ef3cc72ee99127680c96db1f439c7b04e9ea6badb90820356e9beaa88ef7b6fce769d2a711dae16df4b2916a66a2182d50be8e590fda3e0820151eba0a12fd97cbc70045e701fbe6b2c6d13141c147ae4f11f0e9259d816a45") as &[u8],
+                BranchData {
+                    touch_map: BranchBitmap(0b0010111101111111),
+                    after_map: BranchBitmap(0b0010111101111111),
+                    payload: vec![
+                        StoredCell {
+                            field_bits: PLAINKEY_PART,
+                            extension: None,
+                            plain_key: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000000005").into())),
+                            hash: None,
+                        },
+                        StoredCell {
+                            field_bits: HASHEDKEY_PART | HASH_PART,
+                            extension: Some({
+                                let mut out = ArrayVec::new();
+                                out.push(0x09);
+                                out
+                            }),
+                            plain_key: None,
+                            hash: Some(hex!("84b6ffa0dc93412dbc5675a4856167d494f018749d04036ca7cbdd2b4c21141c").into()),
+                        },
+                        StoredCell {
+                            field_bits: PLAINKEY_PART,
+                            extension: None,
+                            plain_key: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000000006").into())),
+                            hash: None,
+                        },
+                        StoredCell {
+                            field_bits: PLAINKEY_PART,
+                            extension: None,
+                            plain_key: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000010002").into())),
+                            hash: None,
+                        },
+                        StoredCell {
+                            field_bits: HASH_PART,
+                            extension: None,
+                            plain_key: None,
+                            hash: Some(hex!("9f4533f1b8b641fe63d28fd5c827deca05427b086575535adf8536b7c19571d4").into()),
+                        },
+                        StoredCell {
+                            field_bits: PLAINKEY_PART,
+                            extension: None,
+                            plain_key: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000010004").into())),
+                            hash: None,
+                        },
+                        StoredCell {
+                            field_bits: HASH_PART,
+                            extension: None,
+                            plain_key: None,
+                            hash: Some(hex!("78e36b30cc9dace946d7e93f6f9fd2e1b1ca7aee38b5b483417f0fa95f05e6dc").into()),
+                        },
+                        StoredCell {
+                            field_bits: PLAINKEY_PART,
+                            extension: None,
+                            plain_key: Some((hex!("c783e610b30e83ecff161effbb7cd591dfccb722").into(), hex!("0000000000000000000000000000000000000000000000000000000000010005").into())),
+                            hash: None,
+                        },
+                        StoredCell {
+                            field_bits: HASH_PART,
+                            extension: None,
+                            plain_key: None,
+                            hash: Some(hex!("e8a4584ec3838e5f013e695e14c7443acacd635a6bc90dd5165947dd712d9a6c").into()),
+                        },
+                        StoredCell {
+                            field_bits: HASH_PART,
+                            extension: None,
+                            plain_key: None,
+                            hash: Some(hex!("c00d8050a3e3af1ec71d35ef3cc72ee99127680c96db1f439c7b04e9ea6badb9").into()),
+                        },
+                        StoredCell {
+                            field_bits: HASH_PART,
+                            extension: None,
+                            plain_key: None,
+                            hash: Some(hex!("356e9beaa88ef7b6fce769d2a711dae16df4b2916a66a2182d50be8e590fda3e").into()),
+                        },
+                        StoredCell {
+                            field_bits: HASH_PART,
+                            extension: None,
+                            plain_key: None,
+                            hash: Some(hex!("151eba0a12fd97cbc70045e701fbe6b2c6d13141c147ae4f11f0e9259d816a45").into()),
+                        },
+                    ]
+                }
+            )
         ] {
+            println!("{:?}", branch_data);
+            assert_eq!(branch_data.encode(), buf);
+            
             let (decoded, pos) = BranchData::decode(buf, 0).unwrap();
-            assert_eq!(pos, buf.len());
             assert_eq!(decoded, branch_data);
-
-            assert_eq!(decoded.encode(), buf);
+            assert_eq!(pos, buf.len());
         }
     }
 

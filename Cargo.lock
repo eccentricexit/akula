@@ -156,6 +156,7 @@ dependencies = [
  "tracing-subscriber",
  "triehash",
  "trust-dns-resolver",
+ "unsigned-varint",
  "url",
  "uuid 1.1.0",
  "vergen",
@@ -4375,6 +4376,12 @@ name = "unicode-width"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ed742d4ea2bd1176e236172c8429aaf54486e7ac098db29ffe6529e0ce50973"
+
+[[package]]
+name = "unsigned-varint"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d86a8dc7f45e4c1b0d30e43038c38f274e77af056aa5f74b93c2cf9eb3c1c836"
 
 [[package]]
 name = "untrusted"
