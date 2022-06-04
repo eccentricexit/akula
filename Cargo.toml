@@ -135,6 +135,8 @@ hashbrown = { version = "0.12.0", features = [
     "ahash-compile-time-rng",
 ] }
 dashmap = { git = "https://github.com/xacrimon/dashmap" }
+crossbeam = { git = "https://github.com/crossbeam-rs/crossbeam" }
+crossbeam-skiplist = { git = "https://github.com/crossbeam-rs/crossbeam" }
 
 [features]
 default = []

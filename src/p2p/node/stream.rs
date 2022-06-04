@@ -15,7 +15,7 @@ impl SentryStream {
 
     #[allow(clippy::new_ret_no_self)]
     pub async fn new(sentry: &Sentry, pred: Vec<i32>) -> anyhow::Result<NodeStream> {
-        let (penalize_tx, mut penalize_rx) = mpsc::channel(4);
+        let (penalize_tx, mut penalize_rx) = mpsc::channel(128);
         tokio::task::spawn({
             let mut sentry = sentry.clone();
             async move {

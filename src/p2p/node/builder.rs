@@ -69,6 +69,7 @@ impl NodeBuilder {
                 block_cache: LruCache::new(1 << 10),
             }),
             forks,
+            chain_event: Default::default(),
         })
     }
 }

@@ -1,9 +1,12 @@
 #![allow(unreachable_code)]
 
-use super::{stash::Stash, stream::*};
+use super::stash::Stash;
 use crate::{
-    models::{BlockNumber, ChainConfig, MessageWithSignature, H256},
-    p2p::{node::NodeBuilder, types::*},
+    models::{BlockHeader, BlockNumber, ChainConfig, MessageWithSignature, H256},
+    p2p::{
+        node::{stream::*, NodeBuilder, SubscriptionManager},
+        types::*,
+    },
 };
 use bytes::{BufMut, BytesMut};
 use dashmap::DashSet;
@@ -39,7 +42,7 @@ pub struct Node {
     pub(crate) status: RwLock<Status>,
     /// Node chain config.
     pub(crate) config: ChainConfig,
-    /// Highest persistent chain tip.
+    /// Highest unpersistent chain tip.
     pub(crate) chain_tip: RwLock<(BlockNumber, H256)>,
     /// Block caches
     pub(crate) block_caches: Mutex<BlockCaches>,
@@ -47,6 +50,8 @@ pub struct Node {
     pub(crate) bad_blocks: DashSet<H256>,
     /// Chain forks.
     pub(crate) forks: Vec<u64>,
+
+    pub chain_event: SubscriptionManager<BlockHeader>,
 }
 
 impl Node {
@@ -58,6 +63,10 @@ impl Node {
 
 impl Node {
     const SYNC_INTERVAL: Duration = Duration::from_secs(5);
+
+    async fn announce_head(&self, head: BlockHeader) {
+        self.chain_event.send(head).await;
+    }
 
     /// Start node synchronization.
     pub async fn start_sync(self: Arc<Self>) -> anyhow::Result<()> {
@@ -89,9 +98,9 @@ impl Node {
                                     }
                                 }
                             }
-                            Message::BlockHeaders(ref headers)
+                            Message::BlockHeaders(headers)
                                 if requested.lock().remove(&headers.request_id).is_some()
-                                    && headers.headers.len() == 1 =>
+                                    && headers.headers.len() <= 8 =>
                             {
                                 let header = &headers.headers[0];
                                 let hash = header.hash();
@@ -110,6 +119,8 @@ impl Node {
 
                                 if header.number > block_number {
                                     *handler.chain_tip.write() = (header.number, hash);
+                                    handler.announce_head(header.clone()).await;
+
                                     for skip in 1..4_u64 {
                                         let id = rand::thread_rng().gen::<u64>();
                                         tx.send((id, PeerFilter::All, hash, skip)).await?;
@@ -135,6 +146,8 @@ impl Node {
 
                                 if number > block_number {
                                     *handler.chain_tip.write() = (inner.block.header.number, hash);
+                                    handler.announce_head(inner.block.header.clone()).await;
+
                                     for skip in 1..4_u64 {
                                         let id = rand::thread_rng().gen::<u64>();
                                         tx.send((id, PeerFilter::All, hash, skip)).await?;
