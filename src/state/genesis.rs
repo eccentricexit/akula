@@ -1,4 +1,5 @@
 use crate::{
+    commitment::generic::{BranchData, HexPatriciaHashed},
     kv::{mdbx::*, tables},
     models::*,
     res::chainspec::MAINNET,
@@ -6,6 +7,7 @@ use crate::{
 };
 use anyhow::format_err;
 use tempfile::TempDir;
+use tracing::*;
 
 #[derive(Clone, Debug)]
 pub struct GenesisState {
@@ -69,6 +71,7 @@ pub fn initialize_genesis<'db, E>(
 where
     E: EnvironmentKind,
 {
+    let _ = etl_temp_dir;
     if let Some(existing_chainspec) = txn.get(tables::Config, ())? {
         if let Some(chainspec) = chainspec {
             if chainspec != existing_chainspec {
@@ -101,9 +104,47 @@ where
 
     state_buffer.write_to_db()?;
 
-    crate::stages::promote_clean_accounts(txn, etl_temp_dir)?;
-    crate::stages::promote_clean_storage(txn, etl_temp_dir)?;
-    let state_root = crate::trie::regenerate_intermediate_hashes(txn, etl_temp_dir, None)?;
+    struct TxState<'tx, 'db, K, E>
+    where
+        K: TransactionKind,
+        E: EnvironmentKind,
+        'db: 'tx,
+    {
+        txn: &'tx MdbxTransaction<'db, K, E>,
+    }
+
+    impl<'tx, 'db, K, E> crate::commitment::generic::State<Address, RlpAccount>
+        for TxState<'tx, 'db, K, E>
+    where
+        K: TransactionKind,
+        E: EnvironmentKind,
+        'db: 'tx,
+    {
+        fn get_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<BranchData<Address>>> {
+            self.txn.get(tables::AccountCommitment, prefix.to_vec())
+        }
+        fn get_payload(&mut self, address: &Address) -> anyhow::Result<Option<RlpAccount>> {
+            self.txn
+                .get(tables::Account, *address)
+                .map(|acc| acc.map(|acc| acc.to_rlp(EMPTY_ROOT)))
+        }
+    }
+
+    let accounts = txn
+        .cursor(tables::Account)?
+        .walk(None)
+        .map(|res| res.map(|(addr, _)| addr))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let mut tx_state = TxState { txn };
+
+    let (state_root, branch_updates) =
+        HexPatriciaHashed::new(&mut tx_state).process_updates(accounts)?;
+    for (branch_key, branch_update) in branch_updates {
+        txn.set(tables::AccountCommitment, branch_key, branch_update)?;
+    }
+
+    info!("State root is {:?}", state_root);
 
     let header = BlockHeader {
         parent_hash: H256::zero(),

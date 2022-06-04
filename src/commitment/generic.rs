@@ -1,28 +1,20 @@
-use super::{rlputil::*, *};
-use crate::{
-    crypto::keccak256,
-    kv::traits::{TableDecode, TableEncode, TableObject},
-    models::*,
-    prefix_length,
-};
+use super::*;
+use crate::{crypto::keccak256, kv::traits::TableDecode, models::*, prefix_length};
 use anyhow::{bail, ensure, format_err, Context};
 use arrayvec::ArrayVec;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
+use fastrlp::{Encodable, RlpEncodable};
 use sha3::{Digest, Keccak256};
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Debug,
 };
 use tracing::*;
-use unsigned_varint::encode::usize_buffer;
-
-fn encode_slice(out: &mut Vec<u8>, s: &[u8]) {
-    out.extend_from_slice(unsigned_varint::encode::usize(s.len(), &mut usize_buffer()));
-    out.extend_from_slice(s);
-}
 
 pub type AccountCellPayload = RlpAccount;
 pub type StorageCellPayload = U256;
+
+const RLP_EMPTY_STRING_CODE: u8 = 0x80;
 
 #[derive(Clone, Debug)]
 pub struct Cell<K, V>
@@ -30,7 +22,7 @@ where
     K: AsRef<[u8]>,
 {
     hash: Option<H256>,
-    down_hashed_key: ArrayVec<u8, 64>,
+    down_hashed_key: ArrayVec<u8, 65>,
     extension: ArrayVec<u8, 64>,
     payload: Option<(K, V)>,
 }
@@ -52,8 +44,26 @@ where
 impl<K, V> Cell<K, V>
 where
     K: AsRef<[u8]>,
+    V: fastrlp::Encodable,
 {
-    const fn compute_hash_len(&self) -> usize {
+    fn compute_hash_len(&self, depth: usize) -> usize {
+        if let Some((_, value)) = &self.payload {
+            let key_len = 64 - depth + 1; // Length of hex key with terminator character
+            let compact_len = (key_len - 1) / 2 + 1;
+            let (kp, kl) = if compact_len > 1 {
+                (1, compact_len)
+            } else {
+                (0, 1)
+            };
+            let mut out = BytesMut::new();
+            value.encode(&mut out);
+            let total_len = kp + kl + out.len();
+            let pt = rlputil::generate_struct_len(total_len).len();
+            if total_len + pt < KECCAK_LENGTH {
+                return total_len + pt;
+            }
+        }
+
         KECCAK_LENGTH + 1
     }
 
@@ -75,12 +85,20 @@ where
         self.hash = up_cell.hash;
     }
 
-    fn fill_from_lower_cell(&mut self, low_cell: Cell<K, V>, pre_extension: &[u8], nibble: usize) {
-        self.payload = low_cell.payload;
+    fn fill_from_lower_cell(
+        &mut self,
+        low_cell: Cell<K, V>,
+        low_depth: usize,
+        pre_extension: &[u8],
+        nibble: usize,
+    ) {
+        if low_depth < 64 || low_cell.payload.is_some() {
+            self.payload = low_cell.payload;
+        }
 
         self.hash = low_cell.hash;
         if self.hash.is_some() {
-            if self.payload.is_none() {
+            if self.payload.is_none() && low_depth < 64 {
                 // Extension is related to branch node, we prepend it by preExtension | nibble
                 self.extension.clear();
                 self.extension.try_extend_from_slice(pre_extension).unwrap();
@@ -165,31 +183,9 @@ impl<K> Default for BranchData<K> {
 
 impl<K> BranchData<K>
 where
-    K: TableObject + Clone,
+    K: TableDecode + Clone,
 {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(2 + 2);
-
-        out.extend_from_slice(&self.touch_map.0.to_be_bytes());
-        out.extend_from_slice(&self.after_map.0.to_be_bytes());
-
-        for payload in &self.payload {
-            out.push(payload.field_bits);
-            if let Some(extension) = &payload.extension {
-                encode_slice(&mut out, &extension[..]);
-            }
-            if let Some(plain_key) = &payload.plain_key {
-                encode_slice(&mut out, TableEncode::encode(plain_key.clone()).as_ref());
-            }
-            if let Some(hash) = &payload.hash {
-                encode_slice(&mut out, &hash[..]);
-            }
-        }
-
-        out
-    }
-
-    pub fn decode(buf: &[u8], mut pos: usize) -> anyhow::Result<(Self, usize)> {
+    pub fn decode_with_pos(buf: &[u8], mut pos: usize) -> anyhow::Result<(Self, usize)> {
         fn extract_length(data: &[u8], mut pos: usize) -> anyhow::Result<(usize, usize)> {
             let mut n = data[pos..].len();
             let (l, rem) = unsigned_varint::decode::usize(&data[pos..])?;
@@ -465,11 +461,14 @@ where
             }
         }
 
-        Ok((self.compute_cell_hash(None, 0), branch_node_updates))
+        Ok((
+            self.compute_cell_hash(None, 0).unwrap_hash(),
+            branch_node_updates,
+        ))
     }
 
     #[instrument(skip(self))]
-    fn compute_cell_hash(&mut self, pos: Option<CellPosition>, depth: usize) -> H256 {
+    fn compute_cell_hash(&mut self, pos: Option<CellPosition>, depth: usize) -> HashOrValue {
         let cell = self.grid.cell_mut(pos);
         if let Some((plain_key, value)) = &cell.payload {
             cell.down_hashed_key.clear();
@@ -485,9 +484,8 @@ where
                 hex::encode(&cell.down_hashed_key[..65 - depth]),
                 hex::encode(&value_rlp)
             );
-            return leaf_hash_with_key(
-                &cell.down_hashed_key[..65 - depth],
-                RlpEncodableBytes(&value_rlp),
+            return HashOrValue::from_rlp(
+                &leaf_node_rlp(&cell.down_hashed_key[..65 - depth], &value_rlp[..])[..],
             );
         }
 
@@ -499,14 +497,17 @@ where
                 hex::encode(&cell.extension),
                 cell_hash
             );
-            extension_hash(&cell.extension, cell_hash)
+            HashOrValue::from_rlp(&extension_node_rlp(
+                &cell.extension,
+                &fastrlp::encode_fixed_size(&cell_hash)[..],
+            ))
         } else if let Some(cell_hash) = cell.hash {
-            cell_hash
+            HashOrValue::Hash(cell_hash)
         } else {
-            EMPTY_HASH
+            HashOrValue::Hash(EMPTY_HASH)
         };
 
-        trace!("computed cell hash {:?}", hex::encode(&buf));
+        trace!("computed cell hash {:?}", buf);
 
         buf
     }
@@ -559,14 +560,7 @@ where
             depth,
             hex::encode(&hashed_key[depth..]),
         );
-        let mut unfolding = cpl + 1;
-        if depth < 64 && depth + unfolding > 64 {
-            // This is to make sure that unfolding always breaks at the level where storage subtrees start
-            unfolding = 64 - depth;
-            trace!("adjusted unfolding={}", unfolding);
-        }
-
-        unfolding
+        cpl + 1
     }
 
     #[instrument(skip(self))]
@@ -695,6 +689,9 @@ where
             let cell = &mut self.grid.rows[row].cells[nibble as usize];
             cell.fill_from_upper_cell(up_cell.clone(), unfolding);
             trace!("cell ({}, {:x}) depth={}", row, nibble, depth);
+            if row == 64 {
+                cell.payload = None;
+            }
             if unfolding > 1 {
                 self.current_key
                     .try_extend_from_slice(&up_cell.down_hashed_key[..unfolding - 1])
@@ -713,6 +710,9 @@ where
             let cell = &mut self.grid.rows[row].cells[nibble as usize];
             cell.fill_from_upper_cell(up_cell.clone(), up_cell.down_hashed_key.len());
             trace!("cell ({}, {:x}) depth={}", row, nibble, depth);
+            if row == 64 {
+                cell.payload = None;
+            }
             if up_cell.down_hashed_key.len() > 1 {
                 self.current_key
                     .try_extend_from_slice(
@@ -820,7 +820,7 @@ where
                 };
                 let up_cell = self.grid.cell_mut(up_cell);
                 up_cell.extension.clear();
-                up_cell.fill_from_lower_cell(cell, &self.current_key[up_depth..], nibble);
+                up_cell.fill_from_lower_cell(cell, depth, &self.current_key[up_depth..], nibble);
 
                 // Delete if it existed
                 if self.grid.rows[row].branch_before {
@@ -856,7 +856,7 @@ where
 
                 for nibble in self.grid.rows[row].after_map.iter() {
                     total_branch_len +=
-                        self.grid.rows[row].cells[nibble as usize].compute_hash_len();
+                        self.grid.rows[row].cells[nibble as usize].compute_hash_len(depth);
                 }
 
                 let mut b = BranchData {
@@ -882,8 +882,15 @@ where
                         col: nibble as usize,
                     };
                     {
-                        hasher.update(&[0x80 + KECCAK_LENGTH as u8]);
-                        hasher.update(&self.compute_cell_hash(Some(cell_pos), depth)[..]);
+                        match self.compute_cell_hash(Some(cell_pos), depth) {
+                            HashOrValue::Value(value) => {
+                                hasher.update(value);
+                            }
+                            HashOrValue::Hash(hash) => {
+                                hasher.update(&[fastrlp::EMPTY_STRING_CODE + KECCAK_LENGTH as u8]);
+                                hasher.update(hash);
+                            }
+                        }
                     }
 
                     if changed_and_present.has(nibble) {
@@ -921,13 +928,13 @@ where
                 }
 
                 let up_cell = self.grid.cell_mut(up_cell);
+                let ext_len = depth - up_depth - 1;
                 up_cell.extension.truncate(depth - up_depth - 1);
-                if !up_cell.extension.is_empty() {
-                    up_cell.extension.clear();
-                    up_cell
-                        .extension
-                        .try_extend_from_slice(&self.current_key[up_depth..])
-                        .unwrap();
+                while up_cell.extension.len() < ext_len {
+                    up_cell.extension.push(0);
+                }
+                if ext_len > 0 {
+                    up_cell.extension[..].copy_from_slice(&self.current_key[up_depth..]);
                 }
                 up_cell.payload = None;
 
@@ -1119,126 +1126,102 @@ fn hex_to_compact(key: &[u8]) -> Vec<u8> {
     buf
 }
 
-fn leaf_hash_with_key(key: &[u8], val: impl RlpSerializable) -> H256 {
-    // Write key
-    let (compact_len, (compact0, ni)) = if has_term(key) {
-        (
-            (key.len() - 1) / 2 + 1,
-            if key.len() & 1 == 0 {
-                (
-                    48 + key[0], // Odd (1<<4) + first nibble
-                    1,
-                )
-            } else {
-                (32, 0)
-            },
-        )
-    } else {
-        (
-            key.len() / 2 + 1,
-            if key.len() & 1 == 1 {
-                (
-                    16 + key[0], // Odd (1<<4) + first nibble
-                    1,
-                )
-            } else {
-                (0, 0)
-            },
-        )
-    };
-    // Compute the total length of binary representation
-    let (kp, kl) = if compact_len > 1 {
-        (Some(0x80 + compact_len as u8), compact_len)
-    } else {
-        (None, 1)
-    };
-    complete_leaf_hash(kp, kl, compact_len, key, compact0, ni, val)
+fn encode_path(nibbles: &[u8], terminating: bool) -> Vec<u8> {
+    let mut res = vec![0u8; nibbles.len() / 2 + 1];
+    let odd = nibbles.len() % 2 != 0;
+    let mut i = 0usize;
+
+    res[0] = if terminating { 0x20 } else { 0x00 };
+    res[0] += if odd { 0x10 } else { 0x00 };
+
+    if odd {
+        res[0] |= nibbles[0];
+        i = 1;
+    }
+
+    for byte in res.iter_mut().skip(1) {
+        *byte = (nibbles[i] << 4) + nibbles[i + 1];
+        i += 2;
+    }
+
+    res
 }
 
-fn extension_hash(key: &[u8], hash: H256) -> H256 {
-    // Compute the total length of binary representation
-    // Write key
-    let (compact_len, (compact0, mut ni)) = if has_term(key) {
-        (
-            (key.len() - 1) / 2 + 1,
-            if key.len() & 1 == 0 {
-                (
-                    0x30 + key[0], // Odd: (3<<4) + first nibble
-                    1,
-                )
-            } else {
-                (0x20, 0)
-            },
-        )
-    } else {
-        (
-            key.len() / 2 + 1,
-            if key.len() & 1 == 1 {
-                (
-                    0x10 + key[0], // Odd: (1<<4) + first nibble
-                    1,
-                )
-            } else {
-                (0, 0)
-            },
-        )
-    };
-    let (kp, kl) = if compact_len > 1 {
-        (Some(0x80 + compact_len as u8), compact_len)
-    } else {
-        (None, 1)
-    };
-    let total_len = if kp.is_some() { 1 } else { 0 } + kl + 33;
+#[derive(Clone, Debug, PartialEq)]
+enum HashOrValue {
+    Value(ArrayVec<u8, 31>),
+    Hash(H256),
+}
 
-    let mut hasher = Keccak256::new();
-    hasher.update(&generate_struct_len(total_len));
-    if let Some(kp) = kp {
-        hasher.update(&[kp]);
-    }
-    hasher.update(&[compact0]);
-    if compact_len > 1 {
-        for _ in 1..compact_len {
-            hasher.update(&[key[ni] * 16 + key[ni + 1]]);
-            ni += 2
+impl HashOrValue {
+    fn from_rlp(rlp: &[u8]) -> Self {
+        if rlp.len() < KECCAK_LENGTH {
+            let mut v = ArrayVec::new();
+            v.try_extend_from_slice(rlp).unwrap();
+            Self::Value(v)
+        } else {
+            Self::Hash(keccak256(rlp))
         }
     }
-    hasher.update(&[0x80 + KECCAK_LENGTH as u8]);
-    hasher.update(&hash[..]);
-    // Replace previous hash with the new one
-    H256::from_slice(&hasher.finalize())
+
+    fn unwrap_hash(self) -> H256 {
+        match self {
+            HashOrValue::Value(_) => panic!("not a hash"),
+            HashOrValue::Hash(hash) => hash,
+        }
+    }
 }
 
-fn complete_leaf_hash(
-    kp: Option<u8>,
-    kl: usize,
-    compact_len: usize,
-    key: &[u8],
-    compact0: u8,
-    mut ni: usize,
-    val: impl rlputil::RlpSerializable,
-) -> H256 {
-    let total_len = if kp.is_some() { 1 } else { 0 } + kl + val.double_rlp_len();
-    let len_prefix = generate_struct_len(total_len);
+fn leaf_node_rlp(path: &[u8], value: &[u8]) -> BytesMut {
+    let terminating = has_term(path);
+    let encoded_path = &encode_path(
+        if terminating {
+            &path[..path.len() - 1]
+        } else {
+            path
+        },
+        terminating,
+    );
 
-    let mut hasher = Keccak256::new();
-    hasher.update(&len_prefix);
-    if let Some(kp) = kp {
-        hasher.update(&[kp]);
+    #[derive(RlpEncodable)]
+    struct S<'a> {
+        encoded_path: &'a [u8],
+        value: &'a [u8],
     }
-    hasher.update(&[compact0]);
-    for _ in 1..compact_len {
-        hasher.update(&[key[ni] * 16 + key[ni + 1]]);
-        ni += 2;
-    }
-    val.to_double_rlp(&mut hasher);
 
-    H256::from_slice(&hasher.finalize()[..])
+    let mut out = BytesMut::new();
+    S {
+        encoded_path,
+        value,
+    }
+    .encode(&mut out);
+    out
+}
+
+fn extension_node_rlp(path: &[u8], child_ref: &[u8]) -> BytesMut {
+    let encoded_path = Bytes::from(encode_path(path, false));
+
+    let mut out = BytesMut::new();
+    let h = fastrlp::Header {
+        list: true,
+        payload_length: fastrlp::Encodable::length(&encoded_path) + child_ref.len(),
+    };
+    h.encode(&mut out);
+    encoded_path.encode(&mut out);
+    out.extend_from_slice(child_ref);
+    out
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        kv::traits::TableEncode,
+        res::chainspec::{GOERLI, MAINNET, ROPSTEN, SEPOLIA},
+    };
+
     use super::*;
     use hex_literal::hex;
+    use maplit::hashmap;
     use std::collections::hash_map::Entry;
     use tracing_subscriber::{prelude::*, EnvFilter};
 
@@ -1407,97 +1390,33 @@ mod tests {
                 }
             )
         ] {
-            println!("{:?}", branch_data);
-            assert_eq!(branch_data.encode(), buf);
-            
-            let (decoded, pos) = BranchData::decode(buf, 0).unwrap();
+            assert_eq!(branch_data.clone().encode(), buf);
+
+            let (decoded, pos) = BranchData::decode_with_pos(buf, 0).unwrap();
             assert_eq!(decoded, branch_data);
             assert_eq!(pos, buf.len());
         }
     }
 
-    #[test]
-    fn sepolia_genesis() {
+    fn test_genesis(
+        input: impl IntoIterator<
+            Item = (
+                [u8; 32],
+                impl IntoIterator<Item = (impl Into<Address>, impl AsU256)>,
+            ),
+        >,
+    ) {
         setup();
 
         let mut state = MockState::default();
 
-        for (expected_state_root, balances) in [
-            (
-                hex!("5eb6e371a698b8d68f665192350ffcecbbbf322916f4b51bd79bb6887da3f494"),
-                vec![
-                    (
-                        hex!("a2a6d93439144ffe4d27c9e088dcd8b783946263"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("bc11295936aa79d594139de1b2e12629414f3bdb"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("7cf5b79bfe291a67ab02b393e456ccc4c266f753"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("aaec86394441f915bce3e6ab399977e9906f3b69"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("f47cae1cf79ca6758bfc787dbd21e6bdbe7112b8"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("d7eddb78ed295b3c9629240e8924fb8d8874ddd8"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("8b7f0977bb4f0fbe7076fa22bc24aca043583f5e"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("e2e2659028143784d557bcec6ff3a0721048880a"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("d9a5179f091d85051d3c982785efd1455cec8699"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("beef32ca5b9a198d27b4e02f4c70439fe60356cf"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("0000006916a87b82333f4245046623b23794c65c"),
-                        0x84595161401484a000000_u128,
-                    ),
-                    (
-                        hex!("b21c33de1fab3fa15499c62b59fe0cc3250020d1"),
-                        0x52b7d2dcc80cd2e4000000_u128,
-                    ),
-                    (
-                        hex!("10f5d45854e038071485ac9e402308cf80d2d2fe"),
-                        0x52b7d2dcc80cd2e4000000_u128,
-                    ),
-                    (
-                        hex!("d7d76c58b3a519e9fa6cc4d22dc017259bc49f1e"),
-                        0x52b7d2dcc80cd2e4000000_u128,
-                    ),
-                    (
-                        hex!("799d329e5f583419167cd722962485926e338f4a"),
-                        0xde0b6b3a7640000_u128,
-                    ),
-                ],
-            ),
-            (
-                hex!("c91d4ecd59dce3067d340b3aadfc0542974b4fb4db98af39f980a91ea00db9dc"),
-                vec![(hex!("2f14582947e292a2ecd20c430b46f2d27cfe213c"), 2 * ETHER)],
-            ),
-        ] {
+        for (expected_state_root, balances) in input {
             let mut updates = HashSet::new();
             for (address, balance) in balances {
+                let address = address.into();
                 state
                     .accounts
-                    .entry(address.into())
+                    .entry(address)
                     .or_insert(RlpAccount {
                         nonce: 0,
                         balance: U256::ZERO,
@@ -1506,7 +1425,7 @@ mod tests {
                     })
                     .balance += balance.as_u256();
 
-                updates.insert(address.into());
+                updates.insert(address);
             }
             let (state_root, updates) = HexPatriciaHashed::new(&mut state)
                 .process_updates(updates)
@@ -1527,5 +1446,49 @@ mod tests {
 
             assert_eq!(state_root, H256(expected_state_root));
         }
+    }
+
+    #[test]
+    fn sepolia_genesis() {
+        test_genesis([
+            (
+                hex!("5eb6e371a698b8d68f665192350ffcecbbbf322916f4b51bd79bb6887da3f494"),
+                SEPOLIA.balances[&BlockNumber(0)].clone(),
+            ),
+            (
+                hex!("c91d4ecd59dce3067d340b3aadfc0542974b4fb4db98af39f980a91ea00db9dc"),
+                hashmap! { hex!("2f14582947e292a2ecd20c430b46f2d27cfe213c").into() => U256::from(2 * ETHER) },
+            ),
+        ]);
+    }
+
+    #[test]
+    fn ropsten_genesis() {
+        test_genesis([(
+            hex!("217b0bbcfb72e2d57e28f33cb361b9983513177755dc3f33ce3e7022ed62b77b"),
+            ROPSTEN.balances[&BlockNumber(0)].clone(),
+        )]);
+    }
+
+    #[test]
+    fn goerli_genesis() {
+        test_genesis([(
+            hex!("5d6cded585e73c4e322c30c2f782a336316f17dd85a4863b9d838d2d4b8b3008"),
+            GOERLI.balances[&BlockNumber(0)].clone(),
+        )]);
+    }
+
+    #[test]
+    fn mainnet_genesis() {
+        test_genesis([
+            (
+                hex!("d7f8974fb5ac78d9ac099b9ad5018bedc2ce0a72dad1827a1709da30580f0544"),
+                MAINNET.balances[&BlockNumber(0)].clone(),
+            ),
+            (
+                hex!("d67e4d450343046425ae4271474353857ab860dbc0a1dde64b41b5cd3a532bf3"),
+                hashmap! { hex!("05a56e2d52c817161883f50c441c3228cfe54d9f").into() => U256::from(5 * ETHER) },
+            ),
+        ]);
     }
 }

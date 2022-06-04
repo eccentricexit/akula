@@ -1,5 +1,5 @@
 use crate::{
-    commitment::{BranchData, HexPatriciaHashed, ProcessUpdateArg},
+    commitment::generic::*,
     consensus::ValidationError,
     kv::{
         mdbx::*,
@@ -15,10 +15,9 @@ use crate::{
 };
 use anyhow::format_err;
 use async_trait::async_trait;
-use itertools::Itertools;
 use std::{
     cmp::{self, Ordering},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
 };
 use tracing::*;
 
@@ -125,73 +124,149 @@ where
 
         if max_block > past_progress {
             let change_iter = gather_changes(tx, past_progress + 1)
-                .take_while(ttw(|(block_number, _)| *block_number <= max_block))
-                .chunks(COMMITMENT_CHUNK);
+                .take_while(ttw(|(block_number, _)| *block_number <= max_block));
+            // .chunks(COMMITMENT_CHUNK);
 
-            let mut state_root =
-                crate::accessors::chain::header::read_canonical(tx, past_progress)?
-                    .unwrap()
-                    .state_root;
-            for chunk in &change_iter {
-                let mut updates = HashMap::<Address, ProcessUpdateArg>::new();
-                for change in chunk {
-                    match change?.1 {
-                        Change::Account(address) => {
-                            updates.entry(address).or_default().account_changed = true;
-                        }
-                        Change::Storage(address, location) => {
-                            updates
-                                .entry(address)
-                                .or_default()
-                                .changed_storage
-                                .insert(location);
-                        }
+            let mut updates = HashMap::<Address, HashSet<H256>>::new();
+            for change in change_iter {
+                match change?.1 {
+                    Change::Account(address) => {
+                        updates.entry(address).or_default();
+                    }
+                    Change::Storage(address, location) => {
+                        updates.entry(address).or_default().insert(location);
                     }
                 }
+            }
 
-                struct TxState<'tx, 'db, K, E>
+            fn compute_storage_root<'db: 'tx, 'tx, E>(
+                tx: &'tx MdbxTransaction<'db, RW, E>,
+                address: Address,
+                locations: impl IntoIterator<Item = H256>,
+            ) -> anyhow::Result<H256>
+            where
+                E: EnvironmentKind,
+            {
+                struct TxStateForStorage<'tx, 'db, K, E>
                 where
                     K: TransactionKind,
                     E: EnvironmentKind,
                     'db: 'tx,
                 {
                     tx: &'tx MdbxTransaction<'db, K, E>,
+                    address: Address,
                 }
 
-                impl<'tx, 'db, K, E> crate::commitment::State for TxState<'tx, 'db, K, E>
+                impl<'tx, 'db, K, E> crate::commitment::generic::State<H256, U256>
+                    for TxStateForStorage<'tx, 'db, K, E>
                 where
                     K: TransactionKind,
                     E: EnvironmentKind,
                     'db: 'tx,
                 {
-                    fn get_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<BranchData>> {
-                        self.tx.get(tables::CommitmentBranch, prefix.to_vec())
-                    }
-                    fn get_account(&mut self, address: Address) -> anyhow::Result<Option<Account>> {
-                        self.tx.get(tables::Account, address)
-                    }
-                    fn get_storage(
+                    fn get_branch(
                         &mut self,
-                        address: Address,
-                        location: H256,
-                    ) -> anyhow::Result<Option<U256>> {
+                        prefix: &[u8],
+                    ) -> anyhow::Result<Option<BranchData<H256>>> {
+                        self.tx.get(
+                            tables::StorageCommitment,
+                            tables::StorageCommitmentKey {
+                                address: self.address,
+                                prefix: prefix.to_vec(),
+                            },
+                        )
+                    }
+                    fn get_payload(&mut self, location: &H256) -> anyhow::Result<Option<U256>> {
                         Ok(self
                             .tx
                             .cursor(tables::Storage)?
-                            .seek_both_range(address, location)?
-                            .filter(|&(l, _)| l == location)
+                            .seek_both_range(self.address, *location)?
+                            .filter(|&(l, _)| l == *location)
                             .map(|(_, v)| v))
                     }
                 }
 
-                let mut tx_state = TxState { tx };
+                let mut tx_state = TxStateForStorage { tx, address };
 
-                let branch_updates;
-                (state_root, branch_updates) =
-                    HexPatriciaHashed::new(&mut tx_state).process_updates(updates)?;
+                let (storage_root, branch_updates) =
+                    HexPatriciaHashed::new(&mut tx_state).process_updates(locations)?;
                 for (branch_key, branch_update) in branch_updates {
-                    tx.set(tables::CommitmentBranch, branch_key, branch_update)?;
+                    tx.set(
+                        tables::StorageCommitment,
+                        tables::StorageCommitmentKey {
+                            address,
+                            prefix: branch_key,
+                        },
+                        branch_update,
+                    )?;
                 }
+
+                Ok(storage_root)
+            }
+
+            let mut storage_roots = HashMap::new();
+            for (address, locations) in updates {
+                let entry = storage_roots.entry(address).or_insert(EMPTY_ROOT);
+                if tx.get(tables::Account, address)?.is_some() {
+                    *entry = compute_storage_root(tx, address, locations)?;
+                } else {
+                    let mut cur = tx.cursor(tables::StorageCommitment)?;
+                    while let Some((k, _)) = cur.seek(address)? {
+                        if k.address == address {
+                            cur.delete_current()?;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            struct TxStateWithStorageRoots<'tx, 'db, E>
+            where
+                E: EnvironmentKind,
+                'db: 'tx,
+            {
+                tx: &'tx MdbxTransaction<'db, RW, E>,
+                storage_roots: HashMap<Address, H256>,
+            }
+
+            impl<'tx, 'db, E> crate::commitment::generic::State<Address, RlpAccount>
+                for TxStateWithStorageRoots<'tx, 'db, E>
+            where
+                E: EnvironmentKind,
+                'db: 'tx,
+            {
+                fn get_branch(
+                    &mut self,
+                    prefix: &[u8],
+                ) -> anyhow::Result<Option<BranchData<Address>>> {
+                    self.tx.get(tables::AccountCommitment, prefix.to_vec())
+                }
+                fn get_payload(&mut self, address: &Address) -> anyhow::Result<Option<RlpAccount>> {
+                    let acc = self.tx.get(tables::Account, *address)?;
+                    Ok(if let Some(acc) = acc {
+                        let storage_root = if let Some(v) = self.storage_roots.get(address).copied()
+                        {
+                            v
+                        } else {
+                            compute_storage_root(self.tx, *address, [])?
+                        };
+
+                        Some(acc.to_rlp(storage_root))
+                    } else {
+                        None
+                    })
+                }
+            }
+
+            let addresses = storage_roots.keys().copied().collect::<Vec<_>>();
+
+            let mut tx_state = TxStateWithStorageRoots { tx, storage_roots };
+
+            let (state_root, branch_updates) =
+                HexPatriciaHashed::new(&mut tx_state).process_updates(addresses)?;
+            for (branch_key, branch_update) in branch_updates {
+                tx.set(tables::AccountCommitment, branch_key, branch_update)?;
             }
 
             let header_state_root = crate::accessors::chain::header::read_canonical(tx, max_block)?

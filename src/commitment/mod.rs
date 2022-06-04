@@ -149,7 +149,7 @@ impl Cell {
         pre_extension: &[u8],
         nibble: usize,
     ) {
-        if low_cell.apk.is_some() || low_depth < 64 {
+        if low_depth < 64 || low_cell.apk.is_some() {
             self.apk = low_cell.apk;
         }
         if low_cell.apk.is_some() {
@@ -586,10 +586,19 @@ pub struct HexPatriciaHashed<'state, S: State> {
     after_map: [BranchBitmap; 128], // For each row, bitmap of cells that were present after modification
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 struct CellPosition {
     row: usize,
     col: usize,
+}
+
+impl Debug for CellPosition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CellPosition")
+            .field("row", &self.row)
+            .field("col", &format_args!("{:x}", self.col))
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1257,13 +1266,13 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
                 }
 
                 let up_cell = self.grid.cell_mut(up_cell);
+                let ext_len = depth - up_depth - 1;
                 up_cell.extension.truncate(depth - up_depth - 1);
-                if !up_cell.extension.is_empty() {
-                    up_cell.extension.clear();
-                    up_cell
-                        .extension
-                        .try_extend_from_slice(&self.current_key[up_depth..])
-                        .unwrap();
+                while up_cell.extension.len() < ext_len {
+                    up_cell.extension.push(0);
+                }
+                if ext_len > 0 {
+                    up_cell.extension[..].copy_from_slice(&self.current_key[up_depth..]);
                 }
                 if depth < 64 {
                     up_cell.apk = None;
@@ -1503,11 +1512,11 @@ fn account_leaf_hash_with_key(key: &[u8], val: impl RlpSerializable) -> ArrayVec
             (key.len() - 1) / 2 + 1,
             if key.len() & 1 == 0 {
                 (
-                    48 + key[0], // Odd (1<<4) + first nibble
+                    0x30 + key[0], // Odd (1<<4) + first nibble
                     1,
                 )
             } else {
-                (32, 0)
+                (0x20, 0)
             },
         )
     } else {
@@ -1515,7 +1524,7 @@ fn account_leaf_hash_with_key(key: &[u8], val: impl RlpSerializable) -> ArrayVec
             key.len() / 2 + 1,
             if key.len() & 1 == 1 {
                 (
-                    16 + key[0], // Odd (1<<4) + first nibble
+                    0x10 + key[0], // Odd (1<<4) + first nibble
                     1,
                 )
             } else {
@@ -1533,14 +1542,15 @@ fn account_leaf_hash_with_key(key: &[u8], val: impl RlpSerializable) -> ArrayVec
 }
 
 fn extension_hash(key: &[u8], hash: H256) -> H256 {
+    let terminating = has_term(key);
     // Compute the total length of binary representation
     // Write key
-    let (compact_len, (compact0, mut ni)) = if has_term(key) {
+    let (compact_len, (compact0, mut ni)) = if terminating {
         (
             (key.len() - 1) / 2 + 1,
             if key.len() & 1 == 0 {
                 (
-                    0x30 + key[0], // Odd: (3<<4) + first nibble
+                    0x20 + 0x10 + key[0], // Odd: (3<<4) + first nibble
                     1,
                 )
             } else {
@@ -1678,8 +1688,11 @@ fn keybytes_to_hex(s: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use crate::res::chainspec::{MAINNET, ROPSTEN, SEPOLIA};
+
     use super::*;
     use hex_literal::hex;
+    use maplit::hashmap;
     use std::collections::hash_map::Entry;
     use tracing_subscriber::{prelude::*, EnvFilter};
 
@@ -1886,89 +1899,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sepolia_genesis() {
+    fn test_genesis(
+        input: impl IntoIterator<
+            Item = (
+                [u8; 32],
+                impl IntoIterator<Item = (impl Into<Address>, impl AsU256)>,
+            ),
+        >,
+    ) {
         setup();
 
         let mut state = MockState::default();
 
-        for (expected_state_root, balances) in [
-            (
-                hex!("5eb6e371a698b8d68f665192350ffcecbbbf322916f4b51bd79bb6887da3f494"),
-                vec![
-                    (
-                        hex!("a2a6d93439144ffe4d27c9e088dcd8b783946263"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("bc11295936aa79d594139de1b2e12629414f3bdb"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("7cf5b79bfe291a67ab02b393e456ccc4c266f753"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("aaec86394441f915bce3e6ab399977e9906f3b69"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("f47cae1cf79ca6758bfc787dbd21e6bdbe7112b8"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("d7eddb78ed295b3c9629240e8924fb8d8874ddd8"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("8b7f0977bb4f0fbe7076fa22bc24aca043583f5e"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("e2e2659028143784d557bcec6ff3a0721048880a"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("d9a5179f091d85051d3c982785efd1455cec8699"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("beef32ca5b9a198d27b4e02f4c70439fe60356cf"),
-                        0xd3c21bcecceda1000000_u128,
-                    ),
-                    (
-                        hex!("0000006916a87b82333f4245046623b23794c65c"),
-                        0x84595161401484a000000_u128,
-                    ),
-                    (
-                        hex!("b21c33de1fab3fa15499c62b59fe0cc3250020d1"),
-                        0x52b7d2dcc80cd2e4000000_u128,
-                    ),
-                    (
-                        hex!("10f5d45854e038071485ac9e402308cf80d2d2fe"),
-                        0x52b7d2dcc80cd2e4000000_u128,
-                    ),
-                    (
-                        hex!("d7d76c58b3a519e9fa6cc4d22dc017259bc49f1e"),
-                        0x52b7d2dcc80cd2e4000000_u128,
-                    ),
-                    (
-                        hex!("799d329e5f583419167cd722962485926e338f4a"),
-                        0xde0b6b3a7640000_u128,
-                    ),
-                ],
-            ),
-            (
-                hex!("c91d4ecd59dce3067d340b3aadfc0542974b4fb4db98af39f980a91ea00db9dc"),
-                vec![(hex!("2f14582947e292a2ecd20c430b46f2d27cfe213c"), 2 * ETHER)],
-            ),
-        ] {
+        for (expected_state_root, balances) in input {
             let mut updates = HashMap::new();
             for (address, balance) in balances {
-                state.accounts.entry(address.into()).or_default().balance += balance.as_u256();
+                let address = address.into();
+                state.accounts.entry(address).or_default().balance += balance.as_u256();
 
                 updates.insert(
-                    address.into(),
+                    address,
                     ProcessUpdateArg {
                         account_changed: true,
                         changed_storage: HashSet::new(),
@@ -1980,8 +1930,11 @@ mod tests {
                 .unwrap();
             for (k, branch) in updates {
                 match state.branches.entry(k) {
-                    Entry::Occupied(mut pre) => {
-                        pre.insert(merge_hex_branches(pre.get(), &branch).unwrap());
+                    Entry::Occupied(pre) => {
+                        let (k, pre) = pre.remove_entry();
+                        state
+                            .branches
+                            .insert(k, merge_hex_branches(&pre, &branch).unwrap());
                     }
                     Entry::Vacant(e) => {
                         e.insert(branch);
@@ -1991,5 +1944,41 @@ mod tests {
 
             assert_eq!(state_root, H256(expected_state_root));
         }
+    }
+
+    #[test]
+    fn sepolia_genesis() {
+        test_genesis([
+            (
+                hex!("5eb6e371a698b8d68f665192350ffcecbbbf322916f4b51bd79bb6887da3f494"),
+                SEPOLIA.balances[&BlockNumber(0)].clone(),
+            ),
+            (
+                hex!("c91d4ecd59dce3067d340b3aadfc0542974b4fb4db98af39f980a91ea00db9dc"),
+                hashmap! { hex!("2f14582947e292a2ecd20c430b46f2d27cfe213c").into() => U256::from(2 * ETHER) },
+            ),
+        ]);
+    }
+
+    #[test]
+    fn ropsten_genesis() {
+        test_genesis([(
+            hex!("217b0bbcfb72e2d57e28f33cb361b9983513177755dc3f33ce3e7022ed62b77b"),
+            ROPSTEN.balances[&BlockNumber(0)].clone(),
+        )]);
+    }
+
+    #[test]
+    fn mainnet_genesis() {
+        test_genesis([
+            (
+                hex!("d7f8974fb5ac78d9ac099b9ad5018bedc2ce0a72dad1827a1709da30580f0544"),
+                MAINNET.balances[&BlockNumber(0)].clone(),
+            ),
+            (
+                hex!("d67e4d450343046425ae4271474353857ab860dbc0a1dde64b41b5cd3a532bf3"),
+                hashmap! { hex!("05a56e2d52c817161883f50c441c3228cfe54d9f").into() => U256::from(5 * ETHER) },
+            ),
+        ]);
     }
 }
