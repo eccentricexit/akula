@@ -224,6 +224,8 @@ where
     where
         'db: 'tx,
     {
+        let _ = tx;
+        let _ = input;
         todo!()
     }
 }
