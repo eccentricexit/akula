@@ -464,11 +464,7 @@ where
         let mut changed_keys = BTreeMap::new();
 
         for plain_key in updates {
-            let hashed_key = hash_key(plain_key.as_ref(), 0);
-
-            let mut v = ArrayVec::new();
-            v.try_extend_from_slice(&hashed_key[..]).unwrap();
-            changed_keys.insert(v, plain_key);
+            changed_keys.insert(hash_key(plain_key.as_ref(), 0), plain_key);
         }
 
         for (hashed_key, plain_key) in changed_keys {
@@ -511,14 +507,11 @@ where
             }
         }
 
-        Ok((
-            H256::from_slice(&self.compute_cell_hash(None, 0)[1..]),
-            branch_node_updates,
-        ))
+        Ok((self.compute_cell_hash(None, 0), branch_node_updates))
     }
 
     #[instrument(skip(self))]
-    fn compute_cell_hash(&mut self, pos: Option<CellPosition>, depth: usize) -> ArrayVec<u8, 33> {
+    fn compute_cell_hash(&mut self, pos: Option<CellPosition>, depth: usize) -> H256 {
         let cell = self.grid.cell_mut(pos);
         if let Some((plain_key, value)) = &cell.payload {
             cell.down_hashed_key.clear();
@@ -540,9 +533,7 @@ where
             );
         }
 
-        let mut buf = ArrayVec::new();
-        buf.push(0x80 + 32);
-        if !cell.extension.is_empty() {
+        let buf = if !cell.extension.is_empty() {
             // Extension
             let cell_hash = cell.hash.expect("extension without hash");
             trace!(
@@ -550,15 +541,14 @@ where
                 hex::encode(&cell.extension),
                 cell_hash
             );
-            buf.try_extend_from_slice(&extension_hash(&cell.extension, cell_hash).0)
-                .unwrap();
+            extension_hash(&cell.extension, cell_hash)
         } else if let Some(cell_hash) = cell.hash {
-            buf.try_extend_from_slice(&cell_hash[..]).unwrap();
+            cell_hash
         } else {
-            buf.try_extend_from_slice(&EMPTY_HASH[..]).unwrap();
-        }
+            EMPTY_HASH
+        };
 
-        trace!("computed cell hash {}", hex::encode(&buf));
+        trace!("computed cell hash {:?}", hex::encode(&buf));
 
         buf
     }
@@ -567,25 +557,26 @@ where
     fn need_unfolding(&self, hashed_key: &[u8]) -> usize {
         let cell: &Cell<K, V>;
         let mut depth = 0_usize;
-        if let Some((idx, row)) = self.grid.rows.iter().enumerate().rev().next() {
-            let col = hashed_key[self.current_key.len()] as usize;
-            cell = &row.cells[col];
-            depth = row.depth;
-            trace!(
-                "cell ({}, {:x}), currentKey=[{}], depth={}, cell.h=[{:?}]",
-                idx,
-                col,
-                hex::encode(&self.current_key[..]),
-                depth,
-                cell.hash
-            );
-        } else {
+        if self.grid.rows.is_empty() {
             trace!("root");
             cell = &self.grid.root;
             if cell.down_hashed_key.is_empty() && cell.hash.is_none() && !self.root_checked {
                 // Need to attempt to unfold the root
                 return 1;
             }
+        } else {
+            let col = hashed_key[self.current_key.len()] as usize;
+            let row = &self.grid.rows[self.grid.rows.len() - 1];
+            cell = &row.cells[col];
+            depth = row.depth;
+            trace!(
+                "cell ({}, {:x}), currentKey=[{}], depth={}, cell.h=[{:?}]",
+                self.grid.rows.len() - 1,
+                col,
+                hex::encode(&self.current_key[..]),
+                depth,
+                cell.hash
+            );
         }
         if hashed_key.len() <= depth {
             return 0;
@@ -713,7 +704,8 @@ where
             present = self.root_present;
             trace!("root, touched={}, present={}", touched, present);
         } else {
-            let (row_idx, row) = self.grid.rows.iter().enumerate().rev().next().unwrap();
+            let row_idx = self.grid.rows.len() - 1;
+            let row = &self.grid.rows[row_idx];
             up_depth = row.depth;
             let col = hashed_key[up_depth - 1];
             up_cell = row.cells[col as usize].clone();
@@ -728,9 +720,8 @@ where
             );
             self.current_key.push(col);
         };
-        self.grid.rows.pop();
+        let row = self.grid.rows.len();
         self.grid.rows.push(CellRow::default());
-        let row = self.grid.rows.len() - 1;
         if up_cell.down_hashed_key.is_empty() {
             depth = up_depth + 1;
             self.unfold_branch_node(row, touched && !present, depth)?;
@@ -836,9 +827,10 @@ where
                 up_cell.extension.clear();
                 up_cell.down_hashed_key.clear();
                 if self.grid.rows[row].branch_before {
-                    let branch_data = branch_data.get_or_insert_with(BranchData::default);
-                    branch_data.touch_map = self.grid.rows[row].touch_map;
-                    branch_data.after_map.clear();
+                    branch_data = Some(BranchData {
+                        touch_map: self.grid.rows[row].touch_map,
+                        ..Default::default()
+                    });
                 }
                 self.grid.rows.pop();
                 if up_depth > 0 {
@@ -864,19 +856,20 @@ where
                     .trailing_zeros()
                     .try_into()
                     .unwrap();
-                let low_cell = {
+                let cell = {
                     let cell: &Cell<K, V> = &self.grid.rows[row].cells[nibble];
                     cell.clone()
                 };
                 let up_cell = self.grid.cell_mut(up_cell);
                 up_cell.extension.clear();
-                up_cell.fill_from_lower_cell(low_cell, &self.current_key[up_depth..], nibble);
+                up_cell.fill_from_lower_cell(cell, &self.current_key[up_depth..], nibble);
 
                 // Delete if it existed
                 if self.grid.rows[row].branch_before {
-                    let branch_data = branch_data.get_or_insert_with(BranchData::default);
-                    branch_data.touch_map = self.grid.rows[row].touch_map;
-                    branch_data.after_map.clear();
+                    branch_data = Some(BranchData {
+                        touch_map: self.grid.rows[row].touch_map,
+                        ..Default::default()
+                    });
                 }
                 self.grid.rows.pop();
 
@@ -904,13 +897,8 @@ where
                 let mut total_branch_len = 17 - parts_count as usize; // for every empty cell, one byte
 
                 for nibble in self.grid.rows[row].after_map.iter() {
-                    total_branch_len += self
-                        .grid
-                        .cell_mut(Some(CellPosition {
-                            row,
-                            col: nibble as usize,
-                        }))
-                        .compute_hash_len();
+                    total_branch_len +=
+                        self.grid.rows[row].cells[nibble as usize].compute_hash_len();
                 }
 
                 let mut b = BranchData {
@@ -936,8 +924,8 @@ where
                         col: nibble as usize,
                     };
                     {
-                        let cell_hash = self.compute_cell_hash(Some(cell_pos), depth);
-                        hasher.update(cell_hash);
+                        hasher.update(&[0x80 + KECCAK_LENGTH as u8]);
+                        hasher.update(&self.compute_cell_hash(Some(cell_pos), depth)[..]);
                     }
 
                     if changed_and_present.has(nibble) {
@@ -969,14 +957,9 @@ where
 
                 branch_data = Some(b);
 
-                {
-                    let mut i = last_nibble;
-                    while i < 17 {
-                        hasher.update(&[0x80]);
-                        trace!("{:x}: empty({},{:x})", i, row, i);
-
-                        i += 1;
-                    }
+                for i in last_nibble..=16 {
+                    hasher.update(&[0x80]);
+                    trace!("{:x}: empty({},{:x})", i, row, i);
                 }
 
                 let up_cell = self.grid.cell_mut(up_cell);
@@ -1011,39 +994,47 @@ where
         Ok((branch_data, update_key))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), fields(active_rows = self.grid.rows.len()))]
     fn delete_cell(&mut self, hashed_key: ArrayVec<u8, 64>) {
         trace!("called");
-        if let Some((row, cell_row)) = self.grid.rows.iter_mut().enumerate().rev().next() {
-            if cell_row.depth < hashed_key[..].len() {
+        let cell = if let Some(row) = self.grid.rows.len().checked_sub(1) {
+            if self.grid.rows[row].depth < hashed_key[..].len() {
                 trace!(
                     "Skipping spurious delete depth={}, hashed_key_len={}",
-                    cell_row.depth,
+                    self.grid.rows[row].depth,
                     hashed_key[..].len()
                 );
                 return;
             }
             let col = hashed_key[self.current_key.len()];
-            cell_row.cells[col as usize] = Cell::default();
-            if cell_row.after_map.has(col) {
+            if self.grid.rows[row].after_map.has(col) {
                 // Prevent "spurious deletions", i.e. deletion of absent items
-                cell_row.touch_map.add_nibble(col);
-                cell_row.after_map.remove_nibble(col);
+                self.grid.rows[row].touch_map.add_nibble(col);
+                self.grid.rows[row].after_map.remove_nibble(col);
                 trace!("Setting ({}, {:x})", row, col);
             } else {
                 trace!("Ignoring ({}, {:x})", row, col);
             }
+
+            &mut self.grid.rows[row].cells[col as usize]
         } else {
-            self.grid.root = Cell::default();
             self.root_touched = true;
             self.root_present = false;
-        }
+
+            &mut self.grid.root
+        };
+
+        cell.extension.clear();
+        cell.payload = None;
     }
 
     #[instrument(skip(self, hashed_key), fields(hashed_key = &*hex::encode(&hashed_key)))]
     fn update_cell(&mut self, plain_key: K, hashed_key: ArrayVec<u8, 64>, payload: V) {
         trace!("called");
-        let row = self.grid.rows.len().checked_sub(1).unwrap();
+        if self.grid.rows.is_empty() {
+            self.grid.rows.push(CellRow::default());
+        }
+        let row = self.grid.rows.len() - 1;
         let col = hashed_key[self.current_key.len()];
         let cell_row = &mut self.grid.rows[row];
         let cell = &mut cell_row.cells[col as usize];
@@ -1170,7 +1161,7 @@ fn hex_to_compact(key: &[u8]) -> Vec<u8> {
     buf
 }
 
-fn leaf_hash_with_key(key: &[u8], val: impl RlpSerializable) -> ArrayVec<u8, 33> {
+fn leaf_hash_with_key(key: &[u8], val: impl RlpSerializable) -> H256 {
     // Write key
     let (compact_len, (compact0, ni)) = if has_term(key) {
         (
@@ -1267,11 +1258,9 @@ fn complete_leaf_hash(
     compact0: u8,
     mut ni: usize,
     val: impl rlputil::RlpSerializable,
-) -> ArrayVec<u8, 33> {
+) -> H256 {
     let total_len = if kp.is_some() { 1 } else { 0 } + kl + val.double_rlp_len();
     let len_prefix = generate_struct_len(total_len);
-
-    let mut buf = ArrayVec::new();
 
     let mut hasher = Keccak256::new();
     hasher.update(&len_prefix);
@@ -1284,10 +1273,8 @@ fn complete_leaf_hash(
         ni += 2;
     }
     val.to_double_rlp(&mut hasher);
-    buf.push(0x80 + KECCAK_LENGTH as u8);
-    buf.try_extend_from_slice(&hasher.finalize()[..]).unwrap();
 
-    buf
+    H256::from_slice(&hasher.finalize()[..])
 }
 
 #[cfg(test)]
@@ -1345,40 +1332,40 @@ mod tests {
         );
     }
 
-    // #[test]
-    // fn branchdata_encoding() {
-    //     for (buf, branch_data) in [
-    //         (
-    //             &hex!("818081800434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000070434c783e610b30e83ecff161effbb7cd591dfccb722000000000000000000000000000000000000000000000000000000000000000e0434c783e610b30e83ecff161effbb7cd591dfccb7220000000000000000000000000000000000000000000000000000000000000004") as &[u8],
-    //             BranchData {
-    //                 // 7, 8, f
-    //                 touch_map: BranchBitmap(0b1000000110000000),
-    //                 after_map: BranchBitmap(0b1000000110000000),
-    //                 payload: vec![
-    //                     CellPayload {
-    //                         field_bits: STORAGE_PLAIN_PART,
-    //                         extension: None,
-    //                         apk: None,
-    //                         spk: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("0000000000000000000000000000000000000000000000000000000000000007")))),
-    //                         h: None,
-    //                     },
-    //                     CellPayload {
-    //                         field_bits: STORAGE_PLAIN_PART,
-    //                         extension: None,
-    //                         apk: None,
-    //                         spk: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("000000000000000000000000000000000000000000000000000000000000000e")))),
-    //                         h: None,
-    //                     },
-    //                     CellPayload {
-    //                         field_bits: STORAGE_PLAIN_PART,
-    //                         extension: None,
-    //                         apk: None,
-    //                         spk: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("0000000000000000000000000000000000000000000000000000000000000004")))),
-    //                         h: None,
-    //                     },
-    //                 ],
-    //             },
-    //         ),
+    #[test]
+    fn branchdata_encoding() {
+        for (buf, branch_data) in [
+            (
+                &hex!("818081800434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000070434c783e610b30e83ecff161effbb7cd591dfccb722000000000000000000000000000000000000000000000000000000000000000e0434c783e610b30e83ecff161effbb7cd591dfccb7220000000000000000000000000000000000000000000000000000000000000004") as &[u8],
+                BranchData {
+                    // 7, 8, f
+                    touch_map: BranchBitmap(0b1000000110000000),
+                    after_map: BranchBitmap(0b1000000110000000),
+                    payload: vec![
+                        CellPayload {
+                            field_bits: STORAGE_PLAIN_PART,
+                            extension: None,
+                            apk: None,
+                            spk: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("0000000000000000000000000000000000000000000000000000000000000007")))),
+                            h: None,
+                        },
+                        CellPayload {
+                            field_bits: STORAGE_PLAIN_PART,
+                            extension: None,
+                            apk: None,
+                            spk: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("000000000000000000000000000000000000000000000000000000000000000e")))),
+                            h: None,
+                        },
+                        CellPayload {
+                            field_bits: STORAGE_PLAIN_PART,
+                            extension: None,
+                            apk: None,
+                            spk: Some((Address::from(hex!("c783e610b30e83ecff161effbb7cd591dfccb722")), H256(hex!("0000000000000000000000000000000000000000000000000000000000000004")))),
+                            h: None,
+                        },
+                    ],
+                },
+            ),
     //         (
     //             &hex!("2f7f2f7f0434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000050901092084b6ffa0dc93412dbc5675a4856167d494f018749d04036ca7cbdd2b4c21141c0434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000000060434c783e610b30e83ecff161effbb7cd591dfccb722000000000000000000000000000000000000000000000000000000000001000208209f4533f1b8b641fe63d28fd5c827deca05427b086575535adf8536b7c19571d40434c783e610b30e83ecff161effbb7cd591dfccb7220000000000000000000000000000000000000000000000000000000000010004082078e36b30cc9dace946d7e93f6f9fd2e1b1ca7aee38b5b483417f0fa95f05e6dc0434c783e610b30e83ecff161effbb7cd591dfccb72200000000000000000000000000000000000000000000000000000000000100050820e8a4584ec3838e5f013e695e14c7443acacd635a6bc90dd5165947dd712d9a6c0820c00d8050a3e3af1ec71d35ef3cc72ee99127680c96db1f439c7b04e9ea6badb90820356e9beaa88ef7b6fce769d2a711dae16df4b2916a66a2182d50be8e590fda3e0820151eba0a12fd97cbc70045e701fbe6b2c6d13141c147ae4f11f0e9259d816a45") as &[u8],
     //             BranchData {
@@ -1476,14 +1463,14 @@ mod tests {
     //                 ]
     //             }
     //         )
-    //     ] {
-    //         let (decoded, pos) = BranchData::decode(buf, 0).unwrap();
-    //         assert_eq!(pos, buf.len());
-    //         assert_eq!(decoded, branch_data);
+        ] {
+            let (decoded, pos) = BranchData::decode(buf, 0).unwrap();
+            assert_eq!(pos, buf.len());
+            assert_eq!(decoded, branch_data);
 
-    //         assert_eq!(decoded.encode(), buf);
-    //     }
-    // }
+            assert_eq!(decoded.encode(), buf);
+        }
+    }
 
     #[test]
     fn sepolia_genesis() {
