@@ -813,7 +813,7 @@ impl<'state, S: State> HexPatriciaHashed<'state, S> {
         } else if let Some(cell_hash) = cell.h {
             buf.try_extend_from_slice(&cell_hash[..]).unwrap();
         } else {
-            buf.try_extend_from_slice(&EMPTY_HASH[..]).unwrap();
+            buf.try_extend_from_slice(&EMPTY_ROOT[..]).unwrap();
         }
 
         trace!("computed cell hash {}", hex::encode(&buf));
@@ -1747,7 +1747,7 @@ mod tests {
             HexPatriciaHashed::new(&mut state)
                 .process_updates(HashMap::new())
                 .unwrap(),
-            (EMPTY_HASH, HashMap::new())
+            (EMPTY_ROOT, HashMap::new())
         );
     }
 

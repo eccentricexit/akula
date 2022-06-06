@@ -504,7 +504,7 @@ where
         } else if let Some(cell_hash) = cell.hash {
             HashOrValue::Hash(cell_hash)
         } else {
-            HashOrValue::Hash(EMPTY_HASH)
+            HashOrValue::Hash(EMPTY_ROOT)
         };
 
         trace!("computed cell hash {:?}", buf);
@@ -1261,7 +1261,7 @@ mod tests {
             HexPatriciaHashed::new(&mut state)
                 .process_updates([])
                 .unwrap(),
-            (EMPTY_HASH, HashMap::new())
+            (EMPTY_ROOT, HashMap::new())
         );
     }
 
