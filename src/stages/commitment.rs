@@ -3,8 +3,8 @@ use crate::{
     consensus::ValidationError,
     kv::{
         mdbx::*,
-        tables::{self, AccountChange, StorageChange, StorageChangeKey},
-        traits::{ttw, TryGenIter},
+        tables::{self, StorageChangeKey},
+        traits::ttw,
     },
     models::*,
     stagedsync::{
@@ -16,83 +16,17 @@ use crate::{
 use anyhow::format_err;
 use async_trait::async_trait;
 use std::{
-    cmp::{self, Ordering},
+    cmp,
     collections::{HashMap, HashSet},
 };
 use tracing::*;
 
 const COMMITMENT_CHUNK: usize = 90_000;
 
+#[derive(Debug)]
 pub enum Change {
     Account(Address),
     Storage(Address, H256),
-}
-
-pub fn gather_changes<'db, 'tx, K, E>(
-    txn: &'tx MdbxTransaction<'db, K, E>,
-    from: BlockNumber,
-) -> impl Iterator<Item = anyhow::Result<(BlockNumber, Change)>> + 'tx
-where
-    'db: 'tx,
-    K: TransactionKind,
-    E: EnvironmentKind,
-{
-    TryGenIter::from(move || {
-        let mut account_changes = txn.cursor(tables::AccountChangeSet)?;
-        let mut storage_changes = txn.cursor(tables::StorageChangeSet)?;
-
-        let mut account_data = account_changes.seek(from)?;
-        let mut storage_data = storage_changes.seek(from)?;
-
-        loop {
-            let account_pos = account_data
-                .as_ref()
-                .map(|(block_number, change)| (*block_number, change.address))
-                .unwrap_or((BlockNumber(u64::MAX), Address::from([0xff_u8; 20])));
-            let storage_pos = storage_data
-                .as_ref()
-                .map(|(k, _)| (k.block_number, k.address))
-                .unwrap_or((BlockNumber(u64::MAX), Address::from([0xff_u8; 20])));
-
-            if account_pos.0 == BlockNumber(u64::MAX)
-                && storage_pos.0 == BlockNumber(u64::MAX)
-                && account_pos.1 == Address::from([0xff_u8; 20])
-                && storage_pos.1 == Address::from([0xff_u8; 20])
-            {
-                break;
-            }
-
-            let advance_account = match account_pos.0.cmp(&storage_pos.0) {
-                Ordering::Less => true,
-                Ordering::Equal => match account_pos.1.cmp(&storage_pos.1) {
-                    Ordering::Less => true,
-                    Ordering::Equal => true,
-                    Ordering::Greater => false,
-                },
-                Ordering::Greater => false,
-            };
-
-            if advance_account {
-                let (block_number, AccountChange { address, .. }) = account_data.unwrap();
-                yield (block_number, Change::Account(address));
-
-                account_data = account_changes.next()?;
-            } else {
-                let (
-                    StorageChangeKey {
-                        block_number,
-                        address,
-                    },
-                    StorageChange { location, .. },
-                ) = storage_data.unwrap();
-                yield (block_number, Change::Storage(address, location));
-
-                storage_data = storage_changes.next()?;
-            }
-        }
-
-        Ok(())
-    })
 }
 
 #[derive(Debug)]
@@ -123,20 +57,27 @@ where
         let past_progress = input.stage_progress.unwrap_or(genesis);
 
         if max_block > past_progress {
-            let change_iter = gather_changes(tx, past_progress + 1)
-                .take_while(ttw(|(block_number, _)| *block_number <= max_block));
-            // .chunks(COMMITMENT_CHUNK);
-
             let mut updates = HashMap::<Address, HashSet<H256>>::new();
-            for change in change_iter {
-                match change?.1 {
-                    Change::Account(address) => {
-                        updates.entry(address).or_default();
-                    }
-                    Change::Storage(address, location) => {
-                        updates.entry(address).or_default().insert(location);
-                    }
-                }
+            for change in tx
+                .cursor(tables::AccountChangeSet)?
+                .walk(Some(past_progress + 1))
+                .take_while(ttw(|(block_number, _)| *block_number <= max_block))
+            {
+                updates.entry(change?.1.address).or_default();
+            }
+
+            for change in tx
+                .cursor(tables::StorageChangeSet)?
+                .walk(Some(past_progress + 1))
+                .take_while(ttw(|(StorageChangeKey { block_number, .. }, _)| {
+                    *block_number <= max_block
+                }))
+            {
+                let change = change?;
+                updates
+                    .entry(change.0.address)
+                    .or_default()
+                    .insert(change.1.location);
             }
 
             fn compute_storage_root<'db: 'tx, 'tx, E>(
@@ -243,8 +184,7 @@ where
                     self.tx.get(tables::AccountCommitment, prefix.to_vec())
                 }
                 fn get_payload(&mut self, address: &Address) -> anyhow::Result<Option<RlpAccount>> {
-                    let acc = self.tx.get(tables::Account, *address)?;
-                    Ok(if let Some(acc) = acc {
+                    let rlp_acc = if let Some(acc) = self.tx.get(tables::Account, *address)? {
                         let storage_root = if let Some(v) = self.storage_roots.get(address).copied()
                         {
                             v
@@ -255,7 +195,10 @@ where
                         Some(acc.to_rlp(storage_root))
                     } else {
                         None
-                    })
+                    };
+                    trace!("Loaded account {:?}: {:?}", address, rlp_acc);
+
+                    Ok(rlp_acc)
                 }
             }
 
