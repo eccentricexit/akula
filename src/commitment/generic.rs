@@ -481,11 +481,11 @@ where
             value.encode(&mut value_rlp);
             trace!(
                 "accountLeafHashWithKey for [{}]=>[{}]",
-                hex::encode(&cell.down_hashed_key[..65 - depth]),
+                hex::encode(&cell.down_hashed_key[..]),
                 hex::encode(&value_rlp)
             );
             return HashOrValue::from_rlp(
-                &leaf_node_rlp(&cell.down_hashed_key[..65 - depth], &value_rlp[..])[..],
+                &leaf_node_rlp(&cell.down_hashed_key[..], &value_rlp[..])[..],
             );
         }
 
