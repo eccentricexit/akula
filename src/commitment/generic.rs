@@ -24,7 +24,7 @@ where
     hash: Option<H256>,
     down_hashed_key: ArrayVec<u8, 65>,
     extension: ArrayVec<u8, 64>,
-    payload: Option<(K, V)>,
+    payload: Option<(K, Option<V>)>,
 }
 
 impl<K, V> Default for Cell<K, V>
@@ -47,7 +47,7 @@ where
     V: fastrlp::Encodable,
 {
     fn compute_hash_len(&self, depth: usize) -> usize {
-        if let Some((_, value)) = &self.payload {
+        if let Some((_, Some(value))) = &self.payload {
             let key_len = 64 - depth + 1; // Length of hex key with terminator character
             let compact_len = (key_len - 1) / 2 + 1;
             let (kp, kl) = if compact_len > 1 {
@@ -470,7 +470,7 @@ where
     #[instrument(skip(self))]
     fn compute_cell_hash(&mut self, pos: Option<CellPosition>, depth: usize) -> HashOrValue {
         let cell = self.grid.cell_mut(pos);
-        if let Some((plain_key, value)) = &cell.payload {
+        if let Some((plain_key, Some(value))) = &cell.payload {
             cell.down_hashed_key.clear();
             cell.down_hashed_key
                 .try_extend_from_slice(&*hash_key(plain_key.as_ref(), depth))
@@ -614,10 +614,7 @@ where
 
             cell.payload = None;
             if let Some(plain_key) = cell_payload.plain_key {
-                let value = self
-                    .state
-                    .get_payload(&plain_key)?
-                    .ok_or_else(|| format_err!("should not be empty"))?;
+                let value = self.state.get_payload(&plain_key)?;
 
                 cell.payload = Some((plain_key, value));
             }
@@ -1028,7 +1025,7 @@ where
             );
         }
 
-        cell.payload = Some((plain_key, payload));
+        cell.payload = Some((plain_key, Some(payload)));
     }
 }
 
