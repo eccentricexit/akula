@@ -1,8 +1,8 @@
 use crate::{
-    commitment::generic::{BranchData, HexPatriciaHashed},
     kv::{mdbx::*, tables},
     models::*,
     res::chainspec::MAINNET,
+    stages::increment_commitment,
     state::*,
 };
 use anyhow::format_err;
@@ -104,45 +104,7 @@ where
 
     state_buffer.write_to_db()?;
 
-    struct TxState<'tx, 'db, K, E>
-    where
-        K: TransactionKind,
-        E: EnvironmentKind,
-        'db: 'tx,
-    {
-        txn: &'tx MdbxTransaction<'db, K, E>,
-    }
-
-    impl<'tx, 'db, K, E> crate::commitment::generic::State<Address, RlpAccount>
-        for TxState<'tx, 'db, K, E>
-    where
-        K: TransactionKind,
-        E: EnvironmentKind,
-        'db: 'tx,
-    {
-        fn get_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<BranchData<Address>>> {
-            self.txn.get(tables::AccountCommitment, prefix.to_vec())
-        }
-        fn get_payload(&mut self, address: &Address) -> anyhow::Result<Option<RlpAccount>> {
-            self.txn
-                .get(tables::Account, *address)
-                .map(|acc| acc.map(|acc| acc.to_rlp(EMPTY_ROOT)))
-        }
-    }
-
-    let accounts = txn
-        .cursor(tables::Account)?
-        .walk(None)
-        .map(|res| res.map(|(addr, _)| addr))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let mut tx_state = TxState { txn };
-
-    let (state_root, branch_updates) =
-        HexPatriciaHashed::new(&mut tx_state).process_updates(accounts)?;
-    for (branch_key, branch_update) in branch_updates {
-        txn.set(tables::AccountCommitment, branch_key, branch_update)?;
-    }
+    let state_root = increment_commitment(txn, None)?;
 
     info!("State root is {:?}", state_root);
 

@@ -1214,35 +1214,85 @@ fn extension_node_rlp(path: &[u8], child_ref: &[u8]) -> BytesMut {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::{
         kv::traits::TableEncode,
         res::chainspec::{GOERLI, MAINNET, ROPSTEN, SEPOLIA},
     };
-
-    use super::*;
     use hex_literal::hex;
     use maplit::hashmap;
     use std::collections::hash_map::Entry;
     use tracing_subscriber::{prelude::*, EnvFilter};
 
-    #[derive(Debug, Default)]
-    struct MockState {
-        accounts: HashMap<Address, RlpAccount>,
-        account_branches: HashMap<Vec<u8>, BranchData<Address>>,
-
-        storage: HashMap<(Address, H256), U256>,
-        storage_branches: HashMap<Vec<u8>, BranchData<(Address, H256)>>,
+    struct MockStorageState<'a> {
+        storage: Option<&'a HashMap<H256, U256>>,
+        branches: Option<&'a HashMap<Vec<u8>, BranchData<H256>>>,
     }
 
-    impl State<Address, RlpAccount> for MockState {
+    impl<'a> State<H256, U256> for MockStorageState<'a> {
+        fn get_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<BranchData<H256>>> {
+            Ok(self
+                .branches
+                .and_then(|branches| branches.get(prefix).cloned()))
+        }
+
+        fn get_payload(&mut self, key: &H256) -> anyhow::Result<Option<U256>> {
+            Ok(self.storage.and_then(|storage| storage.get(key).copied()))
+        }
+    }
+
+    trait StorageRootProducer {
+        fn produce_root<'a>(&mut self, state: &mut MockStorageState<'a>) -> anyhow::Result<H256>;
+    }
+
+    #[derive(Debug, Default)]
+    struct HexPatriciaHashedStorageRootProducer;
+
+    impl StorageRootProducer for HexPatriciaHashedStorageRootProducer {
+        fn produce_root<'a>(&mut self, state: &mut MockStorageState<'a>) -> anyhow::Result<H256> {
+            let (storage_root, updates) = HexPatriciaHashed::new(state).process_updates([])?;
+            assert_eq!(updates, HashMap::new());
+            Ok(storage_root)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MemoryState<P> {
+        storage_root_producer: P,
+
+        accounts: HashMap<Address, Account>,
+        account_branches: HashMap<Vec<u8>, BranchData<Address>>,
+
+        storage: HashMap<Address, HashMap<H256, U256>>,
+        storage_branches: HashMap<Address, HashMap<Vec<u8>, BranchData<H256>>>,
+    }
+
+    impl<P> State<Address, RlpAccount> for MemoryState<P>
+    where
+        P: StorageRootProducer,
+    {
         fn get_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<BranchData<Address>>> {
             Ok(self.account_branches.get(prefix).cloned())
         }
 
         fn get_payload(&mut self, address: &Address) -> anyhow::Result<Option<RlpAccount>> {
-            Ok(self.accounts.get(address).copied())
+            Ok(if let Some(acc) = self.accounts.get(address) {
+                let storage = self.storage.get(address);
+                let branches = self.storage_branches.get(address);
+
+                Some(
+                    acc.to_rlp(
+                        self.storage_root_producer
+                            .produce_root(&mut MockStorageState { storage, branches })?,
+                    ),
+                )
+            } else {
+                None
+            })
         }
     }
+
+    type MockState = MemoryState<HexPatriciaHashedStorageRootProducer>;
 
     fn setup() {
         let _ = tracing_subscriber::registry()
@@ -1417,10 +1467,9 @@ mod tests {
                 state
                     .accounts
                     .entry(address)
-                    .or_insert(RlpAccount {
+                    .or_insert(Account {
                         nonce: 0,
                         balance: U256::ZERO,
-                        storage_root: EMPTY_ROOT,
                         code_hash: EMPTY_HASH,
                     })
                     .balance += balance.as_u256();
